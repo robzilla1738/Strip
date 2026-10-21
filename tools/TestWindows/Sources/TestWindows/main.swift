@@ -36,12 +36,16 @@ final class Delegate: NSObject, NSApplicationDelegate {
             let size = NSSize(width: 480, height: 320)
             let window: NSWindow
             if dialog {
-                window = NSPanel(
+                let panel = NSPanel(
                     contentRect: NSRect(origin: origin, size: size),
                     styleMask: [.titled, .closable, .utilityWindow],
                     backing: .buffered,
                     defer: false
                 )
+                // NSPanel hides when its app deactivates. The on-device check
+                // launches this panel beside other fixtures, so it has to stay listed.
+                panel.hidesOnDeactivate = false
+                window = panel
             } else {
                 let created = StripTestWindow(
                     contentRect: NSRect(origin: origin, size: size),

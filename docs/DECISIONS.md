@@ -78,6 +78,8 @@ Ticks come from `CVDisplayLink` on each display that has a moving strip. The out
 
 The on-screen list keeps Core Graphics window levels 0 through 8. Level 0 is a normal window. Levels 3 and 8 are floating and modal panels, which is where a dialog lives. Higher levels are menus and status items and stay out of the list. A window floats when a matching rule sets `floating = true`, when its subrole is present and is not `AXStandardWindow`, when `AXSize` is not settable or min size equals max size, when the bundle is Quick Look, or when the window belongs to the engine process. An empty bundle id is matched as the process owner name, so an unpackaged tool can use `bundle_id = "TestWindows"`. Slot rules apply only after those checks decline to float. Fullscreen windows stay out of every strip until `AXFullScreen` clears, then return at the saved index.
 
+A `--dialog` fixture is an `NSPanel` with the utility style. On this OS that panel is window level 3 and reports `AXFloatingWindow`, which is not `AXStandardWindow`, so admission floats it. `NSPanel` hides itself when its process deactivates. The fixture sets `hidesOnDeactivate` to false so the panel stays on screen while the other TestWindows processes are active. The engine does not special-case that flag.
+
 ## Session restore and wake
 
 `state.json` is the query snapshot written on each tick and on exit. Launch matches windows for 10 seconds with `restore::match_windows`: `(CGWindowID, pid)` first, then a unique `(bundle, title, role, subrole)`. An ambiguous title matches nothing. Restored columns keep their saved width and are placed without a spring.
