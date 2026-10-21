@@ -5,6 +5,7 @@ pub mod command;
 pub mod config;
 pub mod display_link;
 pub mod enhanced_ui;
+pub mod focus;
 pub mod hotkeys;
 pub mod lifecycle;
 pub mod metrics;

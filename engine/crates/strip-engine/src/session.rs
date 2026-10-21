@@ -1,4 +1,4 @@
-//! One strip per display. Publishes frames through the writer pool.
+//! One strip per display and Space. Publishes frames through the writer pool.
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -6,21 +6,29 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use strip_core::{
-    layout, CenterMode, DisplayFrame, DisplayMode, Focus, Frame, Gesture, LayoutParams, Spring, Strip, SwipeView, Viewport, Visibility, Window, WindowId,
+    layout, CenterMode, Corner, DisplayFrame, DisplayMode, Focus, Frame, Gesture, LayoutParams, Spring, Strip, SwipeView, Viewport, Visibility, Window, WindowId,
 };
 
 use crate::ax::{self, AxApi, DisplayInfo, ListedWindow, Traits};
 use crate::config::{self, AdmitWindow, Config, Placement};
 use crate::display_link::DisplayDriver;
-use crate::parking::restored_frame;
+use crate::parking::{relocated_repair, repair_relocated, restored_frame};
 use crate::private_api::PrivateApi;
 use crate::restore::{self, SavedSession};
 use crate::writer::{Clock, SystemClock, WriterPool};
 
+/// Active strip identity. SkyLight uses the live Space id. Without it the id
+/// stays `0` until a space switch, then [`crate::private_api::fallback_space_key`].
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct StripKey {
+    display: String,
+    space: u64,
+}
+
 pub struct Runtime {
     config: Config,
     pool: WriterPool<AxApi>,
-    strips: HashMap<String, Strip>,
+    strips: HashMap<StripKey, Strip>,
     meta: HashMap<u64, Meta>,
     last_on_screen: HashMap<u64, Frame>,
     state: Arc<Mutex<String>>,
@@ -43,7 +51,13 @@ pub struct Runtime {
     departed: HashMap<u64, Departed>,
     settle: bool,
     force_resolve: bool,
+    skylight: bool,
+    /// True after a space switch when SkyLight is missing. Keeps the fallback hash stable.
+    space_switched: bool,
     space_id: u64,
+    park_repaired: HashSet<u64>,
+    extra_left: HashSet<String>,
+    extra_right: HashSet<String>,
     pointer_x: f64,
     pointer_y: f64,
     pointer_at: Instant,
@@ -103,6 +117,7 @@ struct Meta {
     title: String,
     owner: String,
     display: String,
+    space: u64,
     role: String,
     subrole: String,
 }
@@ -165,7 +180,12 @@ impl Runtime {
             departed: HashMap::new(),
             settle: false,
             force_resolve: false,
+            skylight: private_api.skylight,
+            space_switched: false,
             space_id: crate::private_api::current_space(),
+            park_repaired: HashSet::new(),
+            extra_left: HashSet::new(),
+            extra_right: HashSet::new(),
             pointer_x: 0.0,
             pointer_y: 0.0,
             pointer_at: now,
@@ -185,11 +205,10 @@ impl Runtime {
         let display = self.active_display().ok_or(CommandError::NoFocusedWindow)?;
         let visible = self.viewport_of(&display);
         let ratios: Vec<f64> = self
-            .strips
-            .get(&display)
+            .strip(&display)
             .map(|strip| strip.columns.iter().map(|column| column.width_ratio).collect())
             .unwrap_or_default();
-        let scroll = self.strips.get(&display).map(|strip| strip.scroll_x).unwrap_or(0.0);
+        let scroll = self.strip(&display).map(|strip| strip.scroll_x).unwrap_or(0.0);
         let view = SwipeView::from_ratios(
             &ratios,
             visible.width,
@@ -210,7 +229,7 @@ impl Runtime {
         let Some(scroll) = update.scroll else {
             return Ok(());
         };
-        if let Some(strip) = self.strips.get_mut(&display) {
+        if let Some(strip) = self.strip_mut(&display) {
             strip.scroll_x = scroll;
             if let Some(index) = update.focus {
                 if index < strip.columns.len() {
@@ -243,13 +262,20 @@ impl Runtime {
         }
         let displays = ax::displays(self.config.layout.dock_aware);
         self.screens = displays.clone();
+        if self.skylight {
+            self.space_id = crate::private_api::current_space().max(1);
+        }
         let mut listed = self.eligible(&ax::on_screen_windows());
+        let active = self.active_space();
+        for window in &mut listed {
+            window.space = crate::private_api::assign_strip_space(self.skylight, active, None, true);
+        }
         listed.sort_by_key(|window| window.id);
         let need_resolve = self.force_resolve || listed.iter().any(|window| !self.meta.contains_key(&window.id) && !self.floating.contains_key(&window.id));
         if need_resolve || self.saved.is_some() {
             self.pool.with_api(|api| ax::resolve_elements(api, &listed));
         }
-        let seen: HashSet<u64> = listed.iter().map(|window| window.id).collect();
+        let mut seen: HashSet<u64> = listed.iter().map(|window| window.id).collect();
         self.floating.retain(|id, _| seen.contains(id));
         let restoring = self.saved.as_ref().is_some_and(|saved| !saved.windows.is_empty()) && Instant::now() <= self.restore_until;
         if restoring {
@@ -295,6 +321,13 @@ impl Runtime {
             fresh.push((window.clone(), traits));
         }
         self.adopt_fresh(fresh, front, own_pid, &params);
+        let off_space = self.off_space_catalog(&listed);
+        for window in &off_space {
+            seen.insert(window.id);
+        }
+        self.place_off_space(&off_space, front, &params);
+        self.transfer_moved(&listed, &params);
+        self.transfer_moved(&off_space, &params);
         self.remove_missing(&seen, &params);
         self.focus_follows_pointer();
         self.publish_layouts(&displays, &params);
@@ -302,6 +335,21 @@ impl Runtime {
         self.pool.poll_enhanced_ui();
         self.publish_state(&self.screens);
         self.store_metrics();
+    }
+
+    /// Space change. Does not sleep. The fallback hash runs only on this path.
+    pub fn switch_space(&mut self) {
+        let ids: Vec<u64> = ax::on_screen_windows().into_iter().map(|window| window.id).collect();
+        let live = crate::private_api::current_space();
+        self.space_id = crate::private_api::space_key_after_switch(self.skylight, live, &ids);
+        if !self.skylight {
+            self.space_switched = true;
+        }
+        self.settle = true;
+        self.force_resolve = true;
+        self.tick();
+        self.settle = false;
+        self.force_resolve = false;
     }
 
     /// Wait, re-enable the event tap, and re-apply the current strips without animation.
@@ -391,7 +439,7 @@ impl Runtime {
         let visible = self.viewport_of(&display);
         let focus_action = is_focus_action(action);
         {
-            let strip = self.strips.get_mut(&display).ok_or(CommandError::NoFocusedWindow)?;
+            let strip = self.strip_mut(&display).ok_or(CommandError::NoFocusedWindow)?;
             if focus_action && strip.columns.is_empty() && strip.pinned_left.is_none() && strip.pinned_right.is_none() {
                 return Err(CommandError::NoFocusedWindow);
             }
@@ -402,6 +450,7 @@ impl Runtime {
         self.publish_state(&screens);
         if focus_action {
             let snap = self.focus_snap(&display)?;
+            self.raise_window(snap.window_id);
             if self.config.focus.mouse_follows_focus {
                 if let Some(frame) = self.last_on_screen.get(&snap.window_id).copied() {
                     ax::warp_cursor(frame.x + frame.width / 2.0, frame.y + frame.height / 2.0);
@@ -455,33 +504,50 @@ impl Runtime {
     }
 
     fn remove_missing(&mut self, seen: &HashSet<u64>, params: &LayoutParams) {
-        let stale: Vec<(String, u64)> = self
+        let stale: Vec<(StripKey, u64)> = self
             .meta
             .iter()
             .filter(|(id, _)| !seen.contains(id))
-            .map(|(id, meta)| (meta.display.clone(), *id))
+            .map(|(id, meta)| {
+                (
+                    StripKey {
+                        display: meta.display.clone(),
+                        space: meta.space,
+                    },
+                    *id,
+                )
+            })
             .collect();
-        for (display, id) in stale {
-            if let Some(strip) = self.strips.get(&display) {
+        for (key, id) in stale {
+            if let Some(strip) = self.strips.get(&key) {
                 if let Some((index, window)) = located(strip, id) {
-                    self.departed.insert(id, Departed { window, index, display: display.clone() });
+                    self.departed.insert(
+                        id,
+                        Departed {
+                            window,
+                            index,
+                            display: key.display.clone(),
+                        },
+                    );
                 }
             }
-            if let Some(strip) = self.strips.get_mut(&display) {
-                let visible = Viewport { x: 0.0, y: 0.0, width: 1.0, height: 1.0 };
+            let visible = viewport_for_display(&self.screens, &key.display);
+            if let Some(strip) = self.strips.get_mut(&key) {
                 strip.remove(WindowId(id), params, visible);
             }
             self.meta.remove(&id);
             self.last_on_screen.remove(&id);
             self.motions.remove(&id);
+            self.park_repaired.remove(&id);
         }
     }
 
     fn publish_layouts(&mut self, displays: &[DisplayInfo], params: &LayoutParams) {
+        self.apply_size_overrides();
         let mut flying = false;
         let mut active_displays = Vec::new();
         for display in displays {
-            let Some(strip) = self.strips.get(&display.uuid) else {
+            let Some(strip) = self.strip(&display.uuid) else {
                 continue;
             };
             let visible = viewport(&display.visible);
@@ -490,8 +556,8 @@ impl Runtime {
                 min_y: display.frame.y,
                 max_x: display.frame.right(),
                 max_y: display.frame.bottom(),
-                neighbour_left: display.neighbour_left,
-                neighbour_right: display.neighbour_right,
+                neighbour_left: display.neighbour_left || self.extra_left.contains(&display.uuid),
+                neighbour_right: display.neighbour_right || self.extra_right.contains(&display.uuid),
             };
             let placements = layout(strip, visible, screen, params);
             let mut display_flying = false;
@@ -505,8 +571,17 @@ impl Runtime {
                 };
                 let pid = meta.pid;
                 let bundle = meta.bundle_id.clone();
-                let animate = !matches!(placement.visibility, Visibility::Hidden);
-                if self.follow(pid, id, &bundle, placement.frame, animate) {
+                let hidden = matches!(placement.visibility, Visibility::Hidden);
+                let mut frame = placement.frame;
+                if hidden {
+                    if let Some(repaired) = self.repair_park(id, display, frame) {
+                        frame = repaired;
+                    }
+                } else {
+                    self.park_repaired.remove(&id);
+                }
+                let animate = !hidden;
+                if self.follow(pid, id, &bundle, frame, animate) {
                     display_flying = true;
                 }
             }
@@ -541,7 +616,33 @@ impl Runtime {
     }
 
     fn display_json(&self, display: &DisplayInfo) -> serde_json::Value {
-        let strip = self.strips.get(&display.uuid);
+        let active = self.active_space();
+        let mut strips = Vec::new();
+        if !self.strips.keys().any(|key| key.display == display.uuid && key.space == active) {
+            strips.push(self.strip_body(active, None));
+        }
+        let mut owned: Vec<(u64, &Strip)> = self
+            .strips
+            .iter()
+            .filter(|(key, _)| key.display == display.uuid)
+            .map(|(key, strip)| (key.space, strip))
+            .collect();
+        owned.sort_by_key(|(space, _)| if *space == active { 0u8 } else { 1 });
+        for (space, strip) in owned {
+            strips.push(self.strip_body(space, Some(strip)));
+        }
+        serde_json::json!({
+            "uuid": display.uuid,
+            "name": display.name,
+            "frame": frame_json(display.frame),
+            "visible_frame": frame_json(display.visible),
+            "ignored": self.config.displays.ignored_displays.iter().any(|id| id == &display.uuid),
+            "active_space": active,
+            "strips": strips,
+        })
+    }
+
+    fn strip_body(&self, space: u64, strip: Option<&Strip>) -> serde_json::Value {
         let focused = strip
             .map(|strip| match strip.focus {
                 Focus::Column(index) => index as i64,
@@ -550,20 +651,12 @@ impl Runtime {
             .unwrap_or(0);
         let columns = strip.map(|strip| self.columns_json(strip)).unwrap_or_default();
         serde_json::json!({
-            "uuid": display.uuid,
-            "name": display.name,
-            "frame": frame_json(display.frame),
-            "visible_frame": frame_json(display.visible),
-            "ignored": self.config.displays.ignored_displays.iter().any(|id| id == &display.uuid),
-            "active_space": self.space_id,
-            "strips": [{
-                "space": self.space_id,
-                "scroll_x": strip.map(|strip| strip.scroll_x).unwrap_or(0.0),
-                "focused_column": focused,
-                "pinned_left": strip.map(|strip| pin_json(self, strip.pinned_left.as_ref())).unwrap_or(serde_json::Value::Null),
-                "pinned_right": strip.map(|strip| pin_json(self, strip.pinned_right.as_ref())).unwrap_or(serde_json::Value::Null),
-                "columns": columns,
-            }],
+            "space": space,
+            "scroll_x": strip.map(|strip| strip.scroll_x).unwrap_or(0.0),
+            "focused_column": focused,
+            "pinned_left": strip.map(|strip| pin_json(self, strip.pinned_left.as_ref())).unwrap_or(serde_json::Value::Null),
+            "pinned_right": strip.map(|strip| pin_json(self, strip.pinned_right.as_ref())).unwrap_or(serde_json::Value::Null),
+            "columns": columns,
         })
     }
 }
@@ -841,7 +934,7 @@ impl Runtime {
         }
         if action == "move_column" {
             if let Some(uuid) = args.get("display").and_then(|value| value.as_str()) {
-                let known = self.screens.iter().any(|screen| screen.uuid == uuid) || self.strips.contains_key(uuid);
+                let known = self.screens.iter().any(|screen| screen.uuid == uuid) || self.has_display(uuid);
                 if !known {
                     return Err(CommandError::DisplayNotFound);
                 }
@@ -852,8 +945,10 @@ impl Runtime {
     }
 
     fn active_display(&self) -> Option<String> {
+        let space = self.active_space();
         let occupied = self.screens.iter().find_map(|screen| {
-            let strip = self.strips.get(&screen.uuid)?;
+            let key = StripKey { display: screen.uuid.clone(), space };
+            let strip = self.strips.get(&key)?;
             let occupied = !strip.columns.is_empty() || strip.pinned_left.is_some() || strip.pinned_right.is_some();
             occupied.then(|| screen.uuid.clone())
         });
@@ -861,24 +956,65 @@ impl Runtime {
     }
 
     fn viewport_of(&self, uuid: &str) -> Viewport {
-        self.screens
-            .iter()
-            .find(|screen| screen.uuid == uuid)
-            .map(|screen| viewport(&screen.visible))
-            .unwrap_or(Viewport { x: 0.0, y: 0.0, width: 1.0, height: 1.0 })
+        viewport_for_display(&self.screens, uuid)
+    }
+
+    fn active_space(&self) -> u64 {
+        active_space_id(self.skylight, self.space_id, self.space_switched)
+    }
+
+    fn key_of(&self, display: &str) -> StripKey {
+        StripKey { display: display.to_string(), space: self.active_space() }
+    }
+
+    fn strip(&self, display: &str) -> Option<&Strip> {
+        let key = self.key_of(display);
+        self.strips.get(&key)
+    }
+
+    fn strip_mut(&mut self, display: &str) -> Option<&mut Strip> {
+        let key = self.key_of(display);
+        self.strips.get_mut(&key)
+    }
+
+    fn entry_active(&mut self, display: &str) -> &mut Strip {
+        let key = self.key_of(display);
+        self.strips.entry(key).or_default()
+    }
+
+    fn has_display(&self, uuid: &str) -> bool {
+        self.strips.keys().any(|key| key.display == uuid)
+    }
+
+    fn raise_window(&self, id: u64) {
+        let Some(pid) = self.meta.get(&id).map(|meta| meta.pid) else {
+            return;
+        };
+        self.pool.with_api(|api| {
+            let mut host = crate::focus::AxHost { api };
+            crate::focus::raise_focused(&mut host, id, pid);
+        });
     }
 
     fn locate_window(&self, id: u64) -> Option<(String, usize)> {
-        for (uuid, strip) in &self.strips {
+        let active = self.active_space();
+        let mut fallback = None;
+        for (key, strip) in &self.strips {
             if let Some(index) = strip.columns.iter().position(|column| column.windows.iter().any(|window| window.id.0 == id)) {
-                return Some((uuid.clone(), index));
+                let found = (key.display.clone(), index);
+                if key.space == active {
+                    return Some(found);
+                }
+                if fallback.is_none() {
+                    fallback = Some(found);
+                }
             }
         }
-        None
+        fallback
     }
 
     fn focus_snap(&self, display: &str) -> Result<FocusSnap, CommandError> {
-        let strip = self.strips.get(display).ok_or(CommandError::NoFocusedWindow)?;
+        let strip = self.strip(display).ok_or(CommandError::NoFocusedWindow)?;
         let (column, window_id) = match strip.focus {
             Focus::Column(index) => {
                 let column_model = strip.columns.get(index).ok_or(CommandError::NoFocusedWindow)?;
@@ -947,7 +1083,7 @@ impl Runtime {
             return;
         };
         let visible = self.viewport_of(&drag.display);
-        if let Some(strip) = self.strips.get_mut(&drag.display) {
+        if let Some(strip) = self.strip_mut(&drag.display) {
             let to = dest.min(strip.columns.len().saturating_sub(1));
             strip.move_column(drag.column, to);
             strip.reveal(&params, visible);
@@ -966,12 +1102,12 @@ impl Runtime {
         let params = layout_params(&self.config);
         let visible = self.viewport_of(&display);
         let window = {
-            let strip = self.strips.get(&display).ok_or(CommandError::NoFocusedWindow)?;
+            let strip = self.strip(&display).ok_or(CommandError::NoFocusedWindow)?;
             focused_window(strip).cloned().ok_or(CommandError::NoFocusedWindow)?
         };
         let id = window.id.0;
         let meta = self.meta.get(&id).cloned();
-        if let Some(strip) = self.strips.get_mut(&display) {
+        if let Some(strip) = self.strip_mut(&display) {
             strip.remove(WindowId(id), &params, visible);
         }
         self.floating.insert(
@@ -1017,8 +1153,8 @@ impl Runtime {
         let params = layout_params(&self.config);
         let visible = self.viewport_of(&display);
         let window = Window::new(id, info.pid);
-        let strip = self.strips.entry(display.clone()).or_default();
-        strip.insert(window, info.pid.wrapping_add(1), None, &params, visible);
+        let space = self.active_space();
+        self.entry_active(&display).insert(window, info.pid.wrapping_add(1), None, &params, visible);
         self.meta.insert(
             id,
             Meta {
@@ -1027,6 +1163,7 @@ impl Runtime {
                 title: info.title.clone(),
                 owner: info.bundle_id.clone(),
                 display,
+                space,
                 role: String::new(),
                 subrole: String::new(),
             },
@@ -1040,17 +1177,16 @@ impl Runtime {
     fn move_window_to_display_focused(&mut self, from: &str, target: &str, params: &LayoutParams) -> Result<(), CommandError> {
         let visible_from = self.viewport_of(from);
         let window = {
-            let strip = self.strips.get(from).ok_or(CommandError::NoFocusedWindow)?;
+            let strip = self.strip(from).ok_or(CommandError::NoFocusedWindow)?;
             focused_window(strip).cloned().ok_or(CommandError::NoFocusedWindow)?
         };
         let id = window.id.0;
-        if let Some(strip) = self.strips.get_mut(from) {
+        if let Some(strip) = self.strip_mut(from) {
             strip.remove(WindowId(id), params, visible_from);
         }
         let visible = self.viewport_of(target);
         let pid = window.pid;
-        let strip = self.strips.entry(target.to_string()).or_default();
-        strip.insert(window, pid, None, params, visible);
+        self.entry_active(target).insert(window, pid, None, params, visible);
         if let Some(meta) = self.meta.get_mut(&id) {
             meta.display = target.to_string();
         }
@@ -1061,17 +1197,16 @@ impl Runtime {
     }
 
     fn move_window_to_display(&mut self, id: u64, from: &str, target: &str, params: &LayoutParams) {
-        let Some(window) = self.strips.get(from).and_then(|strip| located(strip, id)).map(|(_, window)| window) else {
+        let Some(window) = self.strip(from).and_then(|strip| located(strip, id)).map(|(_, window)| window) else {
             return;
         };
         let visible_from = self.viewport_of(from);
-        if let Some(strip) = self.strips.get_mut(from) {
+        if let Some(strip) = self.strip_mut(from) {
             strip.remove(WindowId(id), params, visible_from);
         }
         let visible = self.viewport_of(target);
         let pid = window.pid;
-        let strip = self.strips.entry(target.to_string()).or_default();
-        strip.insert(window, pid, None, params, visible);
+        self.entry_active(target).insert(window, pid, None, params, visible);
         if let Some(meta) = self.meta.get_mut(&id) {
             meta.display = target.to_string();
         }
@@ -1114,7 +1249,7 @@ impl Runtime {
         let appended = if siblings.is_empty() {
             None
         } else {
-            self.strips.get(&saved.display).and_then(|strip| {
+            self.strip(&saved.display).and_then(|strip| {
                 strip.columns.iter().position(|column| column.windows.iter().any(|window| siblings.contains(&window.id.0)))
             })
         };
@@ -1122,7 +1257,7 @@ impl Runtime {
         let role = saved.role.clone();
         let subrole = saved.subrole.clone();
         if let Some(index) = appended {
-            if let Some(strip) = self.strips.get_mut(&display) {
+            if let Some(strip) = self.strip_mut(&display) {
                 if let Some(column) = strip.columns.get_mut(index) {
                     column.windows.push(model);
                 }
@@ -1136,7 +1271,7 @@ impl Runtime {
             });
             let apply_scroll = !self.scroll_applied.contains(&display);
             {
-                let strip = self.strips.entry(display.clone()).or_default();
+                let strip = self.entry_active(&display);
                 strip.insert_at(model, saved.column, saved.width_ratio);
                 if apply_scroll {
                     if let Some(scroll) = scroll {
@@ -1214,7 +1349,7 @@ impl Runtime {
         let role = traits.role.clone();
         let subrole = traits.subrole.clone();
         {
-            let strip = self.strips.entry(uuid.clone()).or_default();
+            let strip = self.entry_active(&uuid);
             strip.insert(model_from(window), front, slot, params, visible);
         }
         self.remember(window, &uuid, &role, &subrole);
@@ -1224,7 +1359,7 @@ impl Runtime {
     fn push_tab(&mut self, display: &str, leader: u64, peer: &ListedWindow, traits: &Traits) {
         let role = traits.role.clone();
         let subrole = traits.subrole.clone();
-        let pushed = self.strips.get_mut(display).and_then(|strip| {
+        let pushed = self.strip_mut(display).and_then(|strip| {
             let column = strip.columns.iter_mut().find(|column| column.windows.iter().any(|window| window.id.0 == leader))?;
             column.mode = DisplayMode::Tabbed;
             column.windows.push(model_from(peer));
@@ -1255,13 +1390,13 @@ impl Runtime {
         let mut model = departed.window;
         model.id = WindowId(window.id);
         model.pid = window.pid;
-        let strip = self.strips.entry(display.clone()).or_default();
-        strip.insert(model, front, Some(slot), params, visible);
+        self.entry_active(&display).insert(model, front, Some(slot), params, visible);
         self.remember(window, &display, "", "");
     }
 
     fn remember(&mut self, window: &ListedWindow, display: &str, role: &str, subrole: &str) {
         let bundle = config::shown_bundle(&ax::bundle_id(window.pid), &window.owner);
+        let space = if window.space == 0 { self.active_space() } else { window.space };
         self.meta.insert(
             window.id,
             Meta {
@@ -1270,6 +1405,7 @@ impl Runtime {
                 title: window.title.clone(),
                 owner: window.owner.clone(),
                 display: display.to_string(),
+                space,
                 role: role.to_string(),
                 subrole: subrole.to_string(),
             },
@@ -1288,14 +1424,209 @@ impl Runtime {
     }
 
     fn detach(&mut self, id: u64, params: &LayoutParams) {
-        let Some(display) = self.meta.get(&id).map(|meta| meta.display.clone()) else {
+        let Some((display, space)) = self.meta.get(&id).map(|meta| (meta.display.clone(), meta.space)) else {
             return;
         };
-        if let Some(strip) = self.strips.get_mut(&display) {
-            strip.remove(WindowId(id), params, Viewport { x: 0.0, y: 0.0, width: 1.0, height: 1.0 });
+        let key = StripKey { display: display.clone(), space };
+        let visible = viewport_for_display(&self.screens, &display);
+        if let Some(strip) = self.strips.get_mut(&key) {
+            strip.remove(WindowId(id), params, visible);
         }
         self.meta.remove(&id);
         self.motions.remove(&id);
+        self.park_repaired.remove(&id);
+    }
+
+    fn off_space_catalog(&self, on_screen: &[ListedWindow]) -> Vec<ListedWindow> {
+        if !self.skylight {
+            return Vec::new();
+        }
+        let active = self.active_space();
+        let on_ids: Vec<u64> = on_screen.iter().map(|window| window.id).collect();
+        let mut by_id: HashMap<u64, ListedWindow> = self.eligible(&ax::off_screen_windows()).into_iter().map(|window| (window.id, window)).collect();
+        let mut off = Vec::new();
+        for (id, space) in crate::private_api::windows_outside(&on_ids) {
+            if space == active {
+                continue;
+            }
+            let Some(mut window) = by_id.remove(&id).or_else(|| self.synthesized_off_screen(id)) else {
+                continue;
+            };
+            if window.pid == 0 {
+                continue;
+            }
+            window.space = crate::private_api::assign_strip_space(true, active, Some(space), false);
+            off.push(window);
+        }
+        off
+    }
+
+    fn synthesized_off_screen(&self, id: u64) -> Option<ListedWindow> {
+        let meta = self.meta.get(&id)?;
+        if meta.pid == 0 {
+            return None;
+        }
+        Some(ListedWindow {
+            id,
+            pid: meta.pid,
+            title: meta.title.clone(),
+            owner: meta.owner.clone(),
+            bounds: self.last_on_screen.get(&id).copied().unwrap_or(Frame { x: 0.0, y: 0.0, width: 0.0, height: 0.0 }),
+            space: meta.space,
+        })
+    }
+
+    fn place_off_space(&mut self, windows: &[ListedWindow], front: i32, params: &LayoutParams) {
+        let own_pid = std::process::id() as i32;
+        for window in windows {
+            if crate::private_api::space_is_fullscreen(window.space) {
+                self.depart_fullscreen(window, params);
+                continue;
+            }
+            if self.contains_id(window.id) || self.floating.contains_key(&window.id) || self.fullscreen.contains_key(&window.id) {
+                continue;
+            }
+            let Some(display) = display_for(&self.screens, window.bounds).map(|screen| screen.uuid.clone()) else {
+                continue;
+            };
+            if self.config.displays.ignored_displays.iter().any(|id| id == &display) {
+                continue;
+            }
+            self.pool.with_api(|api| ax::resolve_elements(api, std::slice::from_ref(window)));
+            let traits = self.pool.with_api(|api| api.describe(window.id));
+            if traits.role.is_empty() && traits.subrole.is_empty() {
+                continue;
+            }
+            if traits.fullscreen {
+                self.depart_fullscreen(window, params);
+                continue;
+            }
+            match self.decide(window, &traits, own_pid) {
+                Placement::Float => self.remember_float(window),
+                Placement::Fullscreen => self.depart_fullscreen(window, params),
+                Placement::Manage { .. } => self.insert_on_space(window, &display, window.space, front, params),
+            }
+        }
+    }
+
+    fn insert_on_space(&mut self, window: &ListedWindow, display: &str, space: u64, front: i32, params: &LayoutParams) {
+        let visible = viewport_for_display(&self.screens, display);
+        let key = StripKey { display: display.to_string(), space };
+        self.strips.entry(key).or_default().insert(model_from(window), front, None, params, visible);
+        self.remember(window, display, "", "");
+    }
+
+    fn depart_fullscreen(&mut self, window: &ListedWindow, params: &LayoutParams) {
+        if self.fullscreen.contains_key(&window.id) && !self.meta.contains_key(&window.id) {
+            return;
+        }
+        let (display, space, index, model) = if let Some(meta) = self.meta.get(&window.id) {
+            let display = meta.display.clone();
+            let space = meta.space;
+            let key = StripKey { display: display.clone(), space };
+            let located_window = self.strips.get(&key).and_then(|strip| located(strip, window.id));
+            let index = located_window.as_ref().map(|(index, _)| *index).unwrap_or(0);
+            let model = located_window.map(|(_, model)| model).unwrap_or_else(|| model_from(window));
+            (display, space, index, model)
+        } else {
+            (String::new(), window.space, 0, model_from(window))
+        };
+        if !display.is_empty() {
+            let visible = viewport_for_display(&self.screens, &display);
+            let key = StripKey { display: display.clone(), space };
+            if let Some(strip) = self.strips.get_mut(&key) {
+                strip.remove(WindowId(window.id), params, visible);
+            }
+        }
+        self.meta.remove(&window.id);
+        self.motions.remove(&window.id);
+        self.fullscreen.insert(window.id, Departed { window: model, index, display });
+    }
+
+    fn transfer_moved(&mut self, windows: &[ListedWindow], params: &LayoutParams) {
+        let planned: Vec<(u64, String, u64)> = windows
+            .iter()
+            .filter_map(|window| {
+                let meta = self.meta.get(&window.id)?;
+                let display = display_for(&self.screens, window.bounds)
+                    .map(|screen| screen.uuid.clone())
+                    .filter(|uuid| !uuid.is_empty())
+                    .unwrap_or_else(|| meta.display.clone());
+                if display.is_empty() || (meta.display == display && meta.space == window.space) {
+                    return None;
+                }
+                Some((window.id, display, window.space))
+            })
+            .collect();
+        for (id, display, space) in planned {
+            self.transfer_window(id, &display, space, params);
+        }
+    }
+
+    fn transfer_window(&mut self, id: u64, display: &str, space: u64, params: &LayoutParams) {
+        let Some((from_display, from_space)) = self.meta.get(&id).map(|meta| (meta.display.clone(), meta.space)) else {
+            return;
+        };
+        let from = StripKey { display: from_display.clone(), space: from_space };
+        let Some(window) = self.strips.get(&from).and_then(|strip| located(strip, id)).map(|(_, window)| window) else {
+            return;
+        };
+        let visible_from = viewport_for_display(&self.screens, &from_display);
+        if let Some(strip) = self.strips.get_mut(&from) {
+            strip.remove(WindowId(id), params, visible_from);
+        }
+        let visible = viewport_for_display(&self.screens, display);
+        let pid = window.pid;
+        let key = StripKey { display: display.to_string(), space };
+        self.strips.entry(key).or_default().insert(window, pid, None, params, visible);
+        if let Some(meta) = self.meta.get_mut(&id) {
+            meta.display = display.to_string();
+            meta.space = space;
+        }
+    }
+
+    fn apply_size_overrides(&mut self) {
+        let overrides = self.pool.take_size_overrides();
+        for (id, size) in overrides {
+            for strip in self.strips.values_mut() {
+                if set_size_override(strip, id, size) {
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Read the parked frame back. A center on another display flips the corner
+    /// and exposes 1 pt, once, until the window is visible again.
+    fn repair_park(&mut self, id: u64, display: &DisplayInfo, parked: Frame) -> Option<Frame> {
+        if self.park_repaired.contains(&id) {
+            return None;
+        }
+        let actual = self.pool.read_back(id)?;
+        if actual.width < 1.0 || actual.height < 1.0 {
+            return None;
+        }
+        let home = self.meta.get(&id).map(|meta| meta.display.clone()).unwrap_or_default();
+        let landed = display_for(&self.screens, actual).map(|screen| screen.uuid.clone())?;
+        let corner = park_corner(parked, display.frame.x);
+        relocated_repair(&home, &landed, corner)?;
+        let (flipped, sliver) = repair_relocated(true, corner);
+        match corner {
+            Corner::BottomLeft => {
+                self.extra_left.insert(display.uuid.clone());
+            }
+            Corner::BottomRight => {
+                self.extra_right.insert(display.uuid.clone());
+            }
+        }
+        self.park_repaired.insert(id);
+        let width = parked.width.max(sliver);
+        let height = parked.height.max(sliver);
+        let (x, y) = match flipped {
+            Corner::BottomRight => (display.frame.right() - sliver, display.frame.bottom() - sliver),
+            Corner::BottomLeft => (display.frame.x - width + sliver, display.frame.bottom() - sliver),
+        };
+        Some(Frame { x, y, width, height })
     }
 
     fn focus_follows_pointer(&mut self) {
@@ -1305,7 +1636,7 @@ impl Runtime {
         let Some((id, display, column, _)) = self.window_under(self.pointer_x, self.pointer_y) else {
             return;
         };
-        let Some(strip) = self.strips.get_mut(&display) else {
+        let Some(strip) = self.strip_mut(&display) else {
             return;
         };
         if strip.focus == Focus::Column(column) {
@@ -1318,14 +1649,18 @@ impl Runtime {
     }
 
     fn window_under(&self, x: f64, y: f64) -> Option<(u64, String, usize, Frame)> {
-        for (uuid, strip) in &self.strips {
+        let active = self.active_space();
+        for (key, strip) in &self.strips {
+            if key.space != active {
+                continue;
+            }
             for (index, column) in strip.columns.iter().enumerate() {
                 for window in &column.windows {
                     let Some(frame) = self.last_on_screen.get(&window.id.0).copied() else {
                         continue;
                     };
                     if x >= frame.x && x < frame.right() && y >= frame.y && y < frame.bottom() {
-                        return Some((window.id.0, uuid.clone(), index, frame));
+                        return Some((window.id.0, key.display.clone(), index, frame));
                     }
                 }
             }
@@ -1338,7 +1673,7 @@ impl Runtime {
     }
 
     fn column_spans(&self, display: &str) -> Vec<(f64, f64)> {
-        let Some(strip) = self.strips.get(display) else {
+        let Some(strip) = self.strip(display) else {
             return Vec::new();
         };
         let mut spans = Vec::new();
@@ -1488,6 +1823,92 @@ fn viewport(frame: &Frame) -> Viewport {
         y: frame.y,
         width: frame.width,
         height: frame.height,
+    }
+}
+
+fn viewport_for_display(screens: &[DisplayInfo], display: &str) -> Viewport {
+    screens
+        .iter()
+        .find(|screen| screen.uuid == display)
+        .map(|screen| viewport(&screen.visible))
+        .unwrap_or(Viewport { x: 0.0, y: 0.0, width: 1.0, height: 1.0 })
+}
+
+fn active_space_id(skylight: bool, space_id: u64, switched: bool) -> u64 {
+    if skylight {
+        space_id.max(1)
+    } else if switched {
+        space_id
+    } else {
+        0
+    }
+}
+
+fn park_corner(frame: Frame, display_min_x: f64) -> Corner {
+    if frame.x >= display_min_x {
+        Corner::BottomRight
+    } else {
+        Corner::BottomLeft
+    }
+}
+
+fn set_size_override(strip: &mut Strip, id: u64, size: (f64, f64)) -> bool {
+    for column in &mut strip.columns {
+        if let Some(window) = column.windows.iter_mut().find(|window| window.id.0 == id) {
+            window.size_override = Some(size);
+            return true;
+        }
+    }
+    for pin in [&mut strip.pinned_left, &mut strip.pinned_right] {
+        let Some(pin) = pin.as_mut() else {
+            continue;
+        };
+        if let Some(window) = pin.column.windows.iter_mut().find(|window| window.id.0 == id) {
+            window.size_override = Some(size);
+            return true;
+        }
+    }
+    false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn screen(width: f64) -> DisplayInfo {
+        DisplayInfo {
+            uuid: "main".into(),
+            cg_id: 1,
+            name: "main".into(),
+            frame: Frame { x: 0.0, y: 0.0, width, height: 1117.0 },
+            visible: Frame { x: 0.0, y: 33.0, width, height: 978.0 },
+            neighbour_left: false,
+            neighbour_right: false,
+        }
+    }
+
+    #[test]
+    fn viewport_for_display_uses_the_visible_frame() {
+        let view = viewport_for_display(&[screen(1728.0)], "main");
+        assert_eq!(view.width, 1728.0);
+        assert!(view.width > 100.0);
+        assert_eq!(viewport_for_display(&[], "missing").width, 1.0);
+    }
+
+    #[test]
+    fn active_space_stays_zero_until_a_fallback_switch() {
+        assert_eq!(active_space_id(false, 1, false), 0);
+        assert_eq!(active_space_id(false, 99, true), 99);
+        assert_eq!(active_space_id(true, 4, false), 4);
+        assert_eq!(active_space_id(true, 0, false), 1);
+    }
+
+    #[test]
+    fn park_corner_follows_the_visible_edge() {
+        let left = Frame { x: -100.0, y: 0.0, width: 40.0, height: 40.0 };
+        let right = Frame { x: 10.0, y: 0.0, width: 40.0, height: 40.0 };
+        assert_eq!(park_corner(left, 0.0), Corner::BottomLeft);
+        assert_eq!(park_corner(right, 0.0), Corner::BottomRight);
     }
 }
 

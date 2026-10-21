@@ -1,7 +1,7 @@
 //! Accessibility reads and writes. Private symbols stay in `private_api`.
 #![allow(deprecated, unexpected_cfgs)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_void};
 
@@ -43,6 +43,7 @@ pub struct ListedWindow {
     pub title: String,
     pub owner: String,
     pub bounds: Frame,
+    pub space: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -133,6 +134,34 @@ impl WindowApi for AxApi {
             return;
         };
         unsafe { set_bool(app, "AXEnhancedUserInterface", enabled) };
+    }
+}
+
+/// `AXRaise` on the window and `AXFrontmost` on its application.
+/// False when either element is missing or either call fails.
+pub fn raise(api: &AxApi, window: u64, pid: i32) -> bool {
+    let Some(element) = api.windows.get(&window).map(|element| element.0) else {
+        return false;
+    };
+    let Some(app) = api.apps.get(&pid).map(|element| element.0) else {
+        return false;
+    };
+    unsafe {
+        let action = cf_string("AXRaise");
+        let raised = AXUIElementPerformAction(element, action) == 0;
+        cf_release(action);
+        let front = set_attr(app, "AXFrontmost", kCFBooleanTrue) == 0;
+        raised && front
+    }
+}
+
+pub fn activate(pid: i32) {
+    unsafe {
+        let app: id = msg_send![class!(NSRunningApplication), runningApplicationWithProcessIdentifier: pid];
+        if app.is_null() {
+            return;
+        }
+        let _: objc::runtime::BOOL = msg_send![app, activateWithOptions: 2u64];
     }
 }
 
@@ -264,8 +293,24 @@ pub fn displays(dock_aware: bool) -> Vec<DisplayInfo> {
 }
 
 pub fn on_screen_windows() -> Vec<ListedWindow> {
+    copy_window_list(ON_SCREEN_EXCLUDE_DESKTOP)
+}
+
+/// Windows Core Graphics knows that are not on the current Space's screen.
+/// Callers assign a Space with SkyLight. The on-screen list alone drops them.
+pub fn off_screen_windows() -> Vec<ListedWindow> {
+    let on_screen: HashSet<u64> = on_screen_windows().into_iter().map(|window| window.id).collect();
+    copy_window_list(EXCLUDE_DESKTOP)
+        .into_iter()
+        .filter(|window| !on_screen.contains(&window.id))
+        .collect()
+}
+
+const EXCLUDE_DESKTOP: u32 = 16;
+
+fn copy_window_list(options: u32) -> Vec<ListedWindow> {
     unsafe {
-        let list = CGWindowListCopyWindowInfo(ON_SCREEN_EXCLUDE_DESKTOP, 0);
+        let list = CGWindowListCopyWindowInfo(options, 0);
         if list.is_null() {
             return Vec::new();
         }
@@ -297,6 +342,7 @@ pub fn on_screen_windows() -> Vec<ListedWindow> {
                 title: dict_string(dict, "kCGWindowName"),
                 owner: dict_string(dict, "kCGWindowOwnerName"),
                 bounds,
+                space: 0,
             });
         }
         cf_release(list);
@@ -654,6 +700,7 @@ extern "C" {
     fn AXUIElementSetAttributeValue(element: *mut c_void, attribute: *const c_void, value: *const c_void) -> i32;
     fn AXUIElementSetMessagingTimeout(element: *mut c_void, timeout: f32) -> i32;
     fn AXUIElementIsAttributeSettable(element: *mut c_void, attribute: *const c_void, settable: *mut u8) -> i32;
+    fn AXUIElementPerformAction(element: *mut c_void, action: *const c_void) -> i32;
     fn CGWarpMouseCursorPosition(point: CgPoint) -> i32;
     fn AXValueCreate(kind: u32, value: *const c_void) -> *const c_void;
     fn AXValueGetValue(value: *mut c_void, kind: u32, out: *mut c_void) -> u8;
@@ -671,4 +718,15 @@ extern "C" {
     static kCFBooleanTrue: *const c_void;
     static kCFBooleanFalse: *const c_void;
     fn CFBooleanGetValue(value: *const c_void) -> u8;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn raise_fails_when_the_element_is_unknown() {
+        let api = AxApi::new(&crate::private_api::PrivateApi::live());
+        assert!(!raise(&api, 1, 1));
+    }
 }

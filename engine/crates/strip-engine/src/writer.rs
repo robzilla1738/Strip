@@ -7,7 +7,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
-use strip_core::Frame;
+use strip_core::{observe_size, Frame, SizeWatch};
 
 use crate::enhanced_ui::EnhancedGuard;
 use crate::metrics::Metrics;
@@ -85,6 +85,10 @@ struct Shared<A> {
     metrics: Mutex<Metrics>,
     commits: AtomicU64,
     last_frames: Mutex<HashMap<u64, Frame>>,
+    /// Latest AX frame, including position-only writes.
+    read_backs: Mutex<HashMap<u64, Frame>>,
+    /// Sizes the window kept after two identical misses.
+    overrides: Mutex<HashMap<u64, (f64, f64)>>,
     clock: Arc<dyn Clock>,
 }
 
@@ -107,6 +111,8 @@ impl<A: WindowApi + 'static> WriterPool<A> {
                 metrics: Mutex::new(Metrics::default()),
                 commits: AtomicU64::new(0),
                 last_frames: Mutex::new(HashMap::new()),
+                read_backs: Mutex::new(HashMap::new()),
+                overrides: Mutex::new(HashMap::new()),
                 clock,
             }),
             workers: HashMap::new(),
@@ -183,6 +189,16 @@ impl<A: WindowApi + 'static> WriterPool<A> {
         body(&mut api)
     }
 
+    /// Drain sizes stored after two identical AX misses.
+    pub fn take_size_overrides(&self) -> Vec<(u64, (f64, f64))> {
+        lock(&self.shared.overrides).drain().collect()
+    }
+
+    /// Last frame read back from Accessibility, when a write has happened.
+    pub fn read_back(&self, window: u64) -> Option<Frame> {
+        lock(&self.shared.read_backs).get(&window).copied()
+    }
+
     pub fn shutdown(&mut self) {
         for worker in self.workers.values() {
             worker.state.stop.store(true, Ordering::SeqCst);
@@ -248,6 +264,7 @@ struct Pending {
 fn worker_loop<A: WindowApi>(pid: i32, state: Arc<WorkerState>, shared: Arc<Shared<A>>) {
     let mut applied = HashMap::<u64, u64>::new();
     let mut applied_size = HashMap::<u64, u64>::new();
+    let mut watches = HashMap::<u64, SizeWatch>::new();
     let mut guard = lock(&state.slots);
     loop {
         if state.stop.load(Ordering::SeqCst) {
@@ -294,7 +311,15 @@ fn worker_loop<A: WindowApi>(pid: i32, state: Arc<WorkerState>, shared: Arc<Shar
             let size_generation = if latest.generation == 0 { item.size_generation } else { latest.size_generation };
             let animation_frame = if latest.generation == 0 { item.animation_frame } else { latest.animation_frame };
             let seen_size = applied_size.get(&item.window).copied().unwrap_or(0);
-            apply_one(&shared, pid, item.window, &item.bundle_id, frame, size_generation != seen_size, animation_frame);
+            apply_one(
+                &shared,
+                pid,
+                item.window,
+                &item.bundle_id,
+                frame,
+                size_generation != seen_size && !animation_frame,
+                &mut watches,
+            );
             applied.insert(item.window, generation);
             applied_size.insert(item.window, size_generation);
         }
@@ -310,10 +335,10 @@ fn apply_one<A: WindowApi>(
     bundle: &str,
     frame: Frame,
     write_size: bool,
-    _animation_frame: bool,
+    watches: &mut HashMap<u64, SizeWatch>,
 ) {
     let started = Instant::now();
-    {
+    let read_back = {
         let mut api = lock(&shared.api);
         let now = shared.clock.now();
         lock(&shared.guard).before_write(&mut *api, pid, now);
@@ -322,8 +347,18 @@ fn apply_one<A: WindowApi>(
         } else {
             api.write_position(window, frame.x, frame.y);
         }
-        let _read_back = api.read_frame(window);
+        let read_back = api.read_frame(window);
         lock(&shared.guard).before_write(&mut *api, pid, shared.clock.now());
+        read_back
+    };
+    lock(&shared.read_backs).insert(window, read_back);
+    // Position ticks must not count as size misses. A zero read-back means the
+    // element was not resolved yet, not that the window refused the size.
+    if write_size && read_back.width >= 1.0 && read_back.height >= 1.0 {
+        let watch = watches.entry(window).or_default();
+        if let Some(actual) = observe_size(watch, (frame.width, frame.height), (read_back.width, read_back.height)) {
+            lock(&shared.overrides).insert(window, actual);
+        }
     }
     lock(&shared.last_frames).insert(window, frame);
     shared.commits.fetch_add(1, Ordering::SeqCst);
@@ -476,5 +511,41 @@ mod tests {
         assert_eq!(sizes.load(Ordering::SeqCst), sizes_after_structure);
         assert!(positions.load(Ordering::SeqCst) > 1);
         assert_eq!(pool.metrics().size_writes_during_animation, 0);
+    }
+
+    #[test]
+    fn two_identical_size_misses_store_the_read_back() {
+        let mut api = MockApi::new();
+        api.expect_write_size().returning(|_, _, _| {});
+        api.expect_write_position().returning(|_, _, _| {});
+        api.expect_read_frame().returning(|_| Frame {
+            x: 0.0,
+            y: 10.0,
+            width: 410.0,
+            height: 700.0,
+        });
+        api.expect_enhanced_ui().returning(|_| false);
+        api.expect_set_enhanced_ui().returning(|_, _| {});
+
+        let mut pool = WriterPool::new(api, Arc::new(SystemClock));
+        pool.publish(1, 5, frame(0.0), "com.example.Stubborn");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while pool.commits() < 1 {
+            assert!(Instant::now() < deadline, "first size write did not happen");
+            thread::sleep(Duration::from_millis(5));
+        }
+        pool.publish(1, 5, frame(0.0), "com.example.Stubborn");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while pool.commits() < 2 || !pool.is_idle() {
+            assert!(Instant::now() < deadline, "second size write did not settle");
+            thread::sleep(Duration::from_millis(5));
+        }
+        thread::sleep(Duration::from_millis(30));
+        let overrides = pool.take_size_overrides();
+        pool.shutdown();
+        assert!(
+            overrides.iter().any(|(id, size)| *id == 5 && *size == (410.0, 700.0)),
+            "overrides = {overrides:?}"
+        );
     }
 }

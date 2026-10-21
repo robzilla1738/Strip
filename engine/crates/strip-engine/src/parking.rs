@@ -15,6 +15,16 @@ pub fn repair_relocated(relocated: bool, corner: Corner) -> (Corner, f64) {
     (flipped, 1.0)
 }
 
+/// The display that owns the parked frame differs from the display that owns
+/// the read-back center. Flip the corner and expose 1 pt.
+pub fn relocated_repair(home: &str, landed: &str, corner: Corner) -> Option<(Corner, f64)> {
+    if home.is_empty() || home == landed {
+        None
+    } else {
+        Some(repair_relocated(true, corner))
+    }
+}
+
 pub fn choose_park(side: Side, display: DisplayFrame, gap_outer: f64, sliver: f64) -> (Corner, f64) {
     parked_corner(side, display.neighbour_left, display.neighbour_right, gap_outer, sliver)
 }
@@ -91,5 +101,12 @@ mod tests {
         let (corner, sliver) = repair_relocated(false, Corner::BottomRight);
         assert_eq!(corner, Corner::BottomRight);
         assert_eq!(sliver, 0.0);
+    }
+
+    #[test]
+    fn a_read_back_on_another_display_flips_the_parked_corner() {
+        let repaired = relocated_repair("display-a", "display-b", Corner::BottomLeft);
+        assert_eq!(repaired, Some((Corner::BottomRight, 1.0)));
+        assert_eq!(relocated_repair("display-a", "display-a", Corner::BottomLeft), None);
     }
 }

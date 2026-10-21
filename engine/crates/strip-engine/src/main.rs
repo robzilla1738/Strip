@@ -152,6 +152,9 @@ fn main() -> ExitCode {
             write_state(&cli, &snapshot, &bus);
             break;
         }
+        if wake::take_space_change() {
+            runtime.switch_space();
+        }
         if wake::take_request() {
             runtime.resync_after_wake();
         }
