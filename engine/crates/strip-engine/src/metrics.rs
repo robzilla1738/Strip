@@ -18,6 +18,8 @@ pub struct Metrics {
     pub idle_cpu: f64,
     pub size_writes_during_animation: u64,
     pub display_link_running: bool,
+    pub frame_interval_p95_ms: f64,
+    pub refresh_interval_ms: f64,
 }
 
 impl Metrics {

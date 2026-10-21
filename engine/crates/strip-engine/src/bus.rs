@@ -38,6 +38,7 @@ impl Bus {
         let (reply, rx) = mpsc::channel();
         lock(&self.jobs).push(Job { message, reply });
         self.wake.notify_one();
+        crate::hotkeys::wake_main();
         rx
     }
 

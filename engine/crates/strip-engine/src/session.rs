@@ -5,10 +5,11 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use strip_core::{layout, CenterMode, DisplayFrame, DisplayMode, Focus, Frame, LayoutParams, Strip, Viewport, Visibility, Window};
+use strip_core::{layout, CenterMode, DisplayFrame, DisplayMode, Focus, Frame, LayoutParams, Spring, Strip, Viewport, Visibility, Window};
 
 use crate::ax::{self, AxApi, DisplayInfo, ListedWindow};
 use crate::config::Config;
+use crate::display_link::DisplayDriver;
 use crate::parking::restored_frame;
 use crate::private_api::PrivateApi;
 use crate::writer::{Clock, SystemClock, WriterPool};
@@ -26,6 +27,54 @@ pub struct Runtime {
     ax_trusted: bool,
     screens: Vec<DisplayInfo>,
     config_path: Option<PathBuf>,
+    motions: HashMap<u64, Motion>,
+    driver: DisplayDriver,
+    animating: bool,
+}
+
+struct Motion {
+    x: Spring,
+    y: Spring,
+    width: f64,
+    height: f64,
+    pid: i32,
+    bundle_id: String,
+    pending_shrink: Option<(f64, f64)>,
+}
+
+impl Motion {
+    fn rest(pid: i32, bundle: &str, frame: Frame) -> Self {
+        Self {
+            x: Spring::launch(frame.x, frame.x),
+            y: Spring::launch(frame.y, frame.y),
+            width: frame.width,
+            height: frame.height,
+            pid,
+            bundle_id: bundle.to_string(),
+            pending_shrink: None,
+        }
+    }
+
+    fn settled(&self) -> bool {
+        (self.x.x - self.x.target).abs() < 0.5 && self.x.v.abs() < 5.0 && (self.y.x - self.y.target).abs() < 0.5 && self.y.v.abs() < 5.0
+    }
+
+    fn rendered(&self) -> Frame {
+        Frame {
+            x: self.x.x,
+            y: self.y.x,
+            width: self.width,
+            height: self.height,
+        }
+    }
+
+    fn snap(&mut self, frame: Frame) {
+        self.x = Spring::launch(frame.x, frame.x);
+        self.y = Spring::launch(frame.y, frame.y);
+        self.width = frame.width;
+        self.height = frame.height;
+        self.pending_shrink = None;
+    }
 }
 
 struct Meta {
@@ -60,6 +109,20 @@ impl Runtime {
             ax_trusted,
             screens: Vec::new(),
             config_path,
+            motions: HashMap::new(),
+            driver: DisplayDriver::new(),
+            animating: false,
+        }
+    }
+
+    pub fn is_animating(&self) -> bool {
+        self.animating
+    }
+
+    pub fn drain_frames(&mut self) {
+        let dts = self.driver.take_dts();
+        for dt in dts {
+            self.step_animation(dt);
         }
     }
 
@@ -178,6 +241,8 @@ impl Runtime {
     }
 
     pub fn unpark_all(&mut self) {
+        self.animating = false;
+        self.driver.stop();
         let displays = ax::displays(self.config.layout.dock_aware);
         let visible = displays.first().map(|display| display.visible).unwrap_or(Frame {
             x: 0.0,
@@ -230,12 +295,15 @@ impl Runtime {
             }
             self.meta.remove(&id);
             self.last_on_screen.remove(&id);
+            self.motions.remove(&id);
         }
     }
 
     fn publish_layouts(&mut self, displays: &[DisplayInfo], params: &LayoutParams) {
+        let mut flying = false;
+        let mut active_displays = Vec::new();
         for display in displays {
-            let Some(strip) = self.strips.get_mut(&display.uuid) else {
+            let Some(strip) = self.strips.get(&display.uuid) else {
                 continue;
             };
             let visible = viewport(&display.visible);
@@ -248,6 +316,7 @@ impl Runtime {
                 neighbour_right: display.neighbour_right,
             };
             let placements = layout(strip, visible, screen, params);
+            let mut display_flying = false;
             for placement in placements {
                 let id = placement.window.0;
                 if matches!(placement.visibility, Visibility::Visible | Visibility::Partial) {
@@ -256,9 +325,25 @@ impl Runtime {
                 let Some(meta) = self.meta.get(&id) else {
                     continue;
                 };
-                self.pool.publish(meta.pid, id, placement.frame, &meta.bundle_id);
+                let pid = meta.pid;
+                let bundle = meta.bundle_id.clone();
+                let animate = !matches!(placement.visibility, Visibility::Hidden);
+                if self.follow(pid, id, &bundle, placement.frame, animate) {
+                    display_flying = true;
+                }
+            }
+            if display_flying {
+                flying = true;
+                active_displays.push(display.cg_id);
             }
         }
+        if flying {
+            self.animating = true;
+            for display in active_displays {
+                self.driver.start(display);
+            }
+        }
+        self.store_metrics();
     }
 
     fn publish_state(&self, displays: &[DisplayInfo]) {
@@ -387,9 +472,134 @@ impl CommandError {
     }
 }
 
+enum Follow {
+    Idle,
+    Flying,
+    Write(Frame),
+    Launch { sized: Option<Frame>, current: Frame },
+}
+
 impl Runtime {
+    fn follow(&mut self, pid: i32, id: u64, bundle: &str, target: Frame, animate: bool) -> bool {
+        if !self.motions.contains_key(&id) {
+            self.pool.publish(pid, id, target, bundle);
+            self.motions.insert(id, Motion::rest(pid, bundle, target));
+            return false;
+        }
+        let duration = f64::from(self.config.animation.animation_duration_ms) / 1000.0;
+        let action = {
+            let motion = self.motions.get_mut(&id).expect("motion");
+            motion.pid = pid;
+            motion.bundle_id = bundle.to_string();
+            let size_delta = (motion.width - target.width).abs().max((motion.height - target.height).abs());
+            let pos_delta = (motion.x.target - target.x).abs().max((motion.y.target - target.y).abs());
+            if !animate || duration <= 0.0 {
+                if size_delta > 0.5 || pos_delta > 0.5 || !motion.settled() {
+                    motion.snap(target);
+                    Follow::Write(target)
+                } else {
+                    Follow::Idle
+                }
+            } else if pos_delta <= 0.5 && size_delta <= 0.5 {
+                if motion.settled() { Follow::Idle } else { Follow::Flying }
+            } else if pos_delta <= 0.5 && motion.settled() {
+                motion.snap(target);
+                Follow::Write(target)
+            } else {
+                let grew = target.width * target.height > motion.width * motion.height + 1.0;
+                let shrank = target.width * target.height + 1.0 < motion.width * motion.height;
+                let sized = if size_delta > 0.5 && grew {
+                    let frame = Frame {
+                        x: motion.x.x,
+                        y: motion.y.x,
+                        width: target.width,
+                        height: target.height,
+                    };
+                    motion.width = target.width;
+                    motion.height = target.height;
+                    Some(frame)
+                } else {
+                    None
+                };
+                if shrank {
+                    motion.pending_shrink = Some((target.width, target.height));
+                } else if size_delta > 0.5 && !grew {
+                    motion.width = target.width;
+                    motion.height = target.height;
+                }
+                if pos_delta > 0.5 {
+                    motion.x.retarget(target.x);
+                    motion.y.retarget(target.y);
+                }
+                Follow::Launch { sized, current: motion.rendered() }
+            }
+        };
+        match action {
+            Follow::Idle => false,
+            Follow::Flying => true,
+            Follow::Write(frame) => {
+                self.pool.publish(pid, id, frame, bundle);
+                false
+            }
+            Follow::Launch { sized, current } => {
+                if let Some(frame) = sized {
+                    self.pool.publish(pid, id, frame, bundle);
+                }
+                self.pool.publish_position(pid, id, current, bundle);
+                true
+            }
+        }
+    }
+
+    fn step_animation(&mut self, dt: f64) {
+        if !self.animating {
+            return;
+        }
+        let zeta = self.config.animation.animation_damping;
+        let omega = Spring::omega(f64::from(self.config.animation.animation_duration_ms) / 1000.0);
+        let ids: Vec<u64> = self.motions.keys().copied().collect();
+        let mut still = false;
+        let mut shrinks = Vec::new();
+        for id in ids {
+            let step = {
+                let Some(motion) = self.motions.get_mut(&id) else {
+                    continue;
+                };
+                if motion.settled() {
+                    continue;
+                }
+                let x_done = motion.x.step(dt, zeta, omega);
+                let y_done = motion.y.step(dt, zeta, omega);
+                let done = x_done && y_done;
+                let frame = motion.rendered();
+                let shrink = if done { motion.pending_shrink.take() } else { None };
+                if let Some((width, height)) = shrink {
+                    motion.width = width;
+                    motion.height = height;
+                }
+                (motion.pid, motion.bundle_id.clone(), frame, done, shrink)
+            };
+            let (pid, bundle, frame, done, shrink) = step;
+            self.pool.publish_position(pid, id, frame, &bundle);
+            if let Some((width, height)) = shrink {
+                shrinks.push((pid, id, bundle, Frame { x: frame.x, y: frame.y, width, height }));
+            }
+            if !done {
+                still = true;
+            }
+        }
+        if !still {
+            self.animating = false;
+            self.driver.stop();
+            for (pid, id, bundle, frame) in shrinks {
+                self.pool.publish(pid, id, frame, &bundle);
+            }
+        }
+        self.store_metrics();
+    }
+
     fn store_metrics(&self) {
-        let metrics = self.pool.metrics();
+        let mut metrics = self.pool.metrics();
         let mut ax_write_ms = serde_json::Map::new();
         for (bundle, timing) in metrics.bundles() {
             ax_write_ms.insert(
@@ -401,6 +611,10 @@ impl Runtime {
                 }),
             );
         }
+        let pacing = self.driver.snapshot();
+        metrics.frame_interval_p95_ms = pacing.frame_interval_p95_ms;
+        metrics.refresh_interval_ms = pacing.refresh_interval_ms;
+        metrics.display_link_running = pacing.running;
         let body = serde_json::json!({
             "ax_write_ms": ax_write_ms,
             "frames_per_second": metrics.frames_per_second,
@@ -408,6 +622,8 @@ impl Runtime {
             "idle_cpu": metrics.idle_cpu,
             "size_writes_during_animation": metrics.size_writes_during_animation,
             "display_link_running": metrics.display_link_running,
+            "frame_interval_p95_ms": metrics.frame_interval_p95_ms,
+            "refresh_interval_ms": metrics.refresh_interval_ms,
         });
         if let Ok(text) = serde_json::to_string(&body) {
             *self.metrics_body.lock().unwrap_or_else(|err| err.into_inner()) = text;

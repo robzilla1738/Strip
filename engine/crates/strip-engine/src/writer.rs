@@ -60,6 +60,10 @@ impl Clock for ManualClock {
 struct Published {
     generation: u64,
     frame: Frame,
+    /// Bumps only when a structural size change must be written.
+    size_generation: u64,
+    /// True for a position tick. Structural publishes stay false.
+    animation_frame: bool,
 }
 
 struct Slot {
@@ -110,17 +114,41 @@ impl<A: WindowApi + 'static> WriterPool<A> {
     }
 
     pub fn publish(&mut self, pid: i32, window: u64, frame: Frame, bundle_id: &str) {
+        self.enqueue(pid, window, frame, bundle_id, true);
+    }
+
+    /// Position tick. Does not request a size write.
+    pub fn publish_position(&mut self, pid: i32, window: u64, frame: Frame, bundle_id: &str) {
+        self.enqueue(pid, window, frame, bundle_id, false);
+    }
+
+    fn enqueue(&mut self, pid: i32, window: u64, frame: Frame, bundle_id: &str, write_size: bool) {
         let worker = self.workers.entry(pid).or_insert_with(|| spawn_worker(pid, Arc::clone(&self.shared)));
         {
             let mut slots = lock(&worker.state.slots);
             if let Some(slot) = slots.iter().find(|slot| slot.window == window) {
-                let generation = slot.value.load().generation.saturating_add(1);
-                slot.value.store(Arc::new(Published { generation, frame }));
+                let previous = **slot.value.load();
+                let size_generation = if write_size {
+                    previous.size_generation.saturating_add(1)
+                } else {
+                    previous.size_generation
+                };
+                slot.value.store(Arc::new(Published {
+                    generation: previous.generation.saturating_add(1),
+                    frame,
+                    size_generation,
+                    animation_frame: !write_size,
+                }));
             } else {
                 slots.push(Slot {
                     window,
                     bundle_id: bundle_id.to_string(),
-                    value: Arc::new(ArcSwap::from_pointee(Published { generation: 1, frame })),
+                    value: Arc::new(ArcSwap::from_pointee(Published {
+                        generation: 1,
+                        frame,
+                        size_generation: u64::from(write_size),
+                        animation_frame: !write_size,
+                    })),
                 });
             }
         }
@@ -212,11 +240,14 @@ struct Pending {
     bundle_id: String,
     generation: u64,
     frame: Frame,
+    size_generation: u64,
+    animation_frame: bool,
     slot: Arc<ArcSwap<Published>>,
 }
 
 fn worker_loop<A: WindowApi>(pid: i32, state: Arc<WorkerState>, shared: Arc<Shared<A>>) {
     let mut applied = HashMap::<u64, u64>::new();
+    let mut applied_size = HashMap::<u64, u64>::new();
     let mut guard = lock(&state.slots);
     loop {
         if state.stop.load(Ordering::SeqCst) {
@@ -235,6 +266,8 @@ fn worker_loop<A: WindowApi>(pid: i32, state: Arc<WorkerState>, shared: Arc<Shar
                         bundle_id: slot.bundle_id.clone(),
                         generation: published.generation,
                         frame: published.frame,
+                        size_generation: published.size_generation,
+                        animation_frame: published.animation_frame,
                         slot: Arc::clone(&slot.value),
                     })
                 }
@@ -258,21 +291,37 @@ fn worker_loop<A: WindowApi>(pid: i32, state: Arc<WorkerState>, shared: Arc<Shar
             let latest = **item.slot.load();
             let generation = latest.generation.max(item.generation);
             let frame = if latest.generation == 0 { item.frame } else { latest.frame };
-            apply_one(&shared, pid, item.window, &item.bundle_id, frame);
+            let size_generation = if latest.generation == 0 { item.size_generation } else { latest.size_generation };
+            let animation_frame = if latest.generation == 0 { item.animation_frame } else { latest.animation_frame };
+            let seen_size = applied_size.get(&item.window).copied().unwrap_or(0);
+            apply_one(&shared, pid, item.window, &item.bundle_id, frame, size_generation != seen_size, animation_frame);
             applied.insert(item.window, generation);
+            applied_size.insert(item.window, size_generation);
         }
         guard = lock(&state.slots);
     }
     state.idle.store(true, Ordering::SeqCst);
 }
 
-fn apply_one<A: WindowApi>(shared: &Shared<A>, pid: i32, window: u64, bundle: &str, frame: Frame) {
+fn apply_one<A: WindowApi>(
+    shared: &Shared<A>,
+    pid: i32,
+    window: u64,
+    bundle: &str,
+    frame: Frame,
+    write_size: bool,
+    _animation_frame: bool,
+) {
     let started = Instant::now();
     {
         let mut api = lock(&shared.api);
         let now = shared.clock.now();
         lock(&shared.guard).before_write(&mut *api, pid, now);
-        write_resize_move(&mut *api, window, frame);
+        if write_size {
+            write_resize_move(&mut *api, window, frame);
+        } else {
+            api.write_position(window, frame.x, frame.y);
+        }
         let _read_back = api.read_frame(window);
         lock(&shared.guard).before_write(&mut *api, pid, shared.clock.now());
     }
@@ -386,5 +435,46 @@ mod tests {
         pool.poll_enhanced_ui();
         assert!(enabled.load(Ordering::SeqCst));
         pool.shutdown();
+    }
+
+    #[test]
+    fn animation_frames_write_position_without_size() {
+        let sizes = Arc::new(AtomicU64::new(0));
+        let positions = Arc::new(AtomicU64::new(0));
+        let size_count = Arc::clone(&sizes);
+        let position_count = Arc::clone(&positions);
+        let mut api = MockApi::new();
+        api.expect_write_size().returning(move |_, _, _| {
+            size_count.fetch_add(1, Ordering::SeqCst);
+        });
+        api.expect_write_position().returning(move |_, _, _| {
+            position_count.fetch_add(1, Ordering::SeqCst);
+        });
+        api.expect_read_frame().returning(|_| frame(0.0));
+        api.expect_enhanced_ui().returning(|_| false);
+        api.expect_set_enhanced_ui().returning(|_, _| {});
+
+        let mut pool = WriterPool::new(api, Arc::new(SystemClock));
+        pool.publish(3, 7, frame(1.0), "com.example.App");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while pool.commits() == 0 {
+            assert!(Instant::now() < deadline, "structural write did not happen");
+            thread::sleep(Duration::from_millis(5));
+        }
+        let sizes_after_structure = sizes.load(Ordering::SeqCst);
+        assert!(sizes_after_structure >= 1);
+        for index in 2..8 {
+            pool.publish_position(3, 7, frame(index as f64), "com.example.App");
+        }
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !pool.is_idle() || pool.last_frame(7).map(|frame| frame.x) != Some(7.0) {
+            assert!(Instant::now() < deadline, "position frames did not settle");
+            thread::sleep(Duration::from_millis(5));
+        }
+        thread::sleep(Duration::from_millis(30));
+        pool.shutdown();
+        assert_eq!(sizes.load(Ordering::SeqCst), sizes_after_structure);
+        assert!(positions.load(Ordering::SeqCst) > 1);
+        assert_eq!(pool.metrics().size_writes_during_animation, 0);
     }
 }

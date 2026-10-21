@@ -81,6 +81,7 @@ fn main() -> ExitCode {
     }));
     let mut runtime = Runtime::start(config, cli.config.clone(), &private_api, Arc::clone(&snapshot), Arc::clone(&metrics), trusted);
     let tap = hotkeys::install();
+    hotkeys::remember_main_loop();
     runtime.tick();
     write_state(&cli, &snapshot);
     let mut next_tick = Instant::now() + Duration::from_millis(80);
@@ -91,12 +92,16 @@ fn main() -> ExitCode {
             break;
         }
         // The tap callback runs on this thread while the run loop is pumping.
-        hotkeys::pump(&mut runtime, &bus, 0.02);
+        // Idle waits are long; IPC, the tap, and the display link wake this thread.
+        let slice = if runtime.is_animating() { 0.02 } else { 0.25 };
+        hotkeys::pump(&mut runtime, &bus, slice);
+        runtime.drain_frames();
         let _ = tap.as_ref().map(hotkeys::EventTap::alive);
         for job in bus.poll(Duration::from_millis(0)) {
             let response = dispatch(&mut runtime, &bus, job.message);
             let _ = job.reply.send(response);
         }
+        runtime.drain_frames();
         if lifecycle::stop_requested() {
             runtime.unpark_all();
             write_state(&cli, &snapshot);
@@ -105,7 +110,8 @@ fn main() -> ExitCode {
         if Instant::now() >= next_tick {
             runtime.tick();
             write_state(&cli, &snapshot);
-            next_tick = Instant::now() + Duration::from_millis(80);
+            let period = if runtime.is_animating() { 80 } else { 1000 };
+            next_tick = Instant::now() + Duration::from_millis(period);
         }
     }
     let _ = cli.log;

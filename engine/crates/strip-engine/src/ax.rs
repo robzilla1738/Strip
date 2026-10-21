@@ -48,6 +48,7 @@ pub struct ListedWindow {
 #[derive(Clone, Debug)]
 pub struct DisplayInfo {
     pub uuid: String,
+    pub cg_id: u32,
     pub name: String,
     pub frame: Frame,
     pub visible: Frame,
@@ -212,8 +213,10 @@ pub fn displays(dock_aware: bool) -> Vec<DisplayInfo> {
             };
             let frame = ax_from_ns(full, primary_height);
             let visible = ax_from_ns(chosen, primary_height);
+            let (uuid, cg_id) = display_identity(screen);
             infos.push(DisplayInfo {
-                uuid: display_uuid(screen),
+                uuid,
+                cg_id,
                 name: format!("{}x{}", frame.width.round(), frame.height.round()),
                 frame,
                 visible,
@@ -455,24 +458,24 @@ fn mark_neighbours(displays: &mut [DisplayInfo]) {
     }
 }
 
-unsafe fn display_uuid(screen: id) -> String {
+unsafe fn display_identity(screen: id) -> (String, u32) {
     let description: id = NSScreen::deviceDescription(screen);
     let key = NSString::alloc(nil).init_str("NSScreenNumber");
     let number: id = msg_send![description, objectForKey: key];
     let _: () = msg_send![key, release];
     if number.is_null() {
-        return "display".to_string();
+        return ("display".to_string(), 0);
     }
     let display_id: u32 = msg_send![number, unsignedIntValue];
     let uuid = CGDisplayCreateUUIDFromDisplayID(display_id);
     if uuid.is_null() {
-        return display_id.to_string();
+        return (display_id.to_string(), display_id);
     }
     let text = CFUUIDCreateString(std::ptr::null(), uuid);
     cf_release(uuid);
     let value = cf_string_copy(text);
     cf_release(text);
-    value
+    (value, display_id)
 }
 
 unsafe fn dict_f64(dict: *const c_void, key: &str) -> f64 {

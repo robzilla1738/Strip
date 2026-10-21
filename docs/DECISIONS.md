@@ -66,6 +66,12 @@ The event tap is `kCGHIDEventTap` at the head of the HID stream, as Section 2.7 
 
 IPC `hello`, `query`, and `subscribe` run on the connection thread. `command`, `set_managing`, `reload_config`, and `shutdown` are posted to a condvar mailbox and applied on the main thread before the result line is written. A focus action emits a `focus` event even when the column index does not change. `toggle_float` and `send_next_display` are known actions and return `ok` without changing the model until the step 9 behaviours land, so a later tick cannot disagree with a float flag that does not exist yet.
 
+## Animation driver
+
+The spring integrates with semi-implicit Euler. When ζ is 1 and a step would cross the target, the step snaps to the target and zeroes velocity so a critically damped spring cannot overshoot.
+
+Ticks come from `CVDisplayLink` on each display that has a moving strip. The output callback records the host-time interval, schedules `CFRunLoopPerformBlock` on the main run loop, and wakes that loop. The main thread then steps the springs. `NSScreen.displayLink` is the macOS 14 selector API and cannot call the Rust stepper directly; deployment stays at macOS 13, so CVDisplayLink is the driver on every supported release. Windows layout classifies as hidden stay parked once. A full-size column kept just outside the viewport would paint more than the parking sliver, which the on-device parking check rejects.
+
 ## Definition-of-done search roots
 
 `scripts/dod.sh` searches shipped sources (`engine/crates`, `app`, `tools`, `integrations`, `scripts`). It does not flag `TODO` comments inside the unmodified `engine/upstream` snapshot.

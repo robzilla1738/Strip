@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 arc-swap = "1"
+block = "0.1.6"
 cocoa = "0.26"
 clap = { version = "4", features = ["derive"] }
 core-foundation = "0.10"

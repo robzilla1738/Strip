@@ -3,6 +3,7 @@ pub mod bindings;
 pub mod bus;
 pub mod command;
 pub mod config;
+pub mod display_link;
 pub mod enhanced_ui;
 pub mod hotkeys;
 pub mod lifecycle;

@@ -235,6 +235,70 @@ done
 [[ "$got_z" == 1 ]]
 echo "ctrl+alt-z reached the text field"
 
+if [[ -n "${WINDOWS_PID:-}" ]] && kill -0 "$WINDOWS_PID" 2>/dev/null; then
+  kill "$WINDOWS_PID" 2>/dev/null || true
+  wait "$WINDOWS_PID" 2>/dev/null || true
+fi
+WINDOWS_PID=""
+sleep 0.3
+"$TESTAPP" --count 8 --key-log "$WORK/keys.log" >"$WORK/windows8.out" 2>&1 &
+WINDOWS_PID=$!
+managed=0
+for _ in $(seq 1 40); do
+  if body="$(query 2>/dev/null)"; then
+    managed="$(printf '%s' "$body" | jq '[.displays[]?.strips[]?.columns[]?.windows[]] | length' 2>/dev/null || echo 0)"
+    if [[ "$managed" -ge 8 ]]; then
+      break
+    fi
+  fi
+  sleep 0.25
+done
+echo "managed8=$managed"
+if [[ "$managed" -lt 8 ]]; then
+  echo "expected 8 managed windows"
+  query || true
+  exit 1
+fi
+for _ in 1 2 3 4 5; do
+  "$CLI" --socket "$SOCKET" focus_right
+done
+paced=0
+for _ in $(seq 1 60); do
+  metrics="$("$CLI" --socket "$SOCKET" query metrics --json 2>/dev/null || true)"
+  if python3 -c '
+import json, sys
+raw = sys.argv[1]
+try:
+    metrics = json.loads(raw)
+except json.JSONDecodeError:
+    raise SystemExit(1)
+p95 = float(metrics.get("frame_interval_p95_ms") or 0)
+refresh = float(metrics.get("refresh_interval_ms") or 0)
+sizes = int(metrics.get("size_writes_during_animation") or 0)
+running = bool(metrics.get("display_link_running"))
+if sizes != 0:
+    raise SystemExit(2)
+if running or p95 <= 0 or refresh <= 0 or p95 > 1.5 * refresh:
+    raise SystemExit(1)
+print(f"p95={p95:.3f} refresh={refresh:.3f} size_writes={sizes}")
+' "$metrics"; then
+    paced=1
+    break
+  fi
+  sleep 0.05
+done
+if [[ "$paced" != 1 ]]; then
+  echo "animation metrics failed"
+  "$CLI" --socket "$SOCKET" query metrics --json || true
+  tail -40 "$WORK/engine.out" || true
+  exit 1
+fi
+sleep 30
+cpu="$(ps -p "$ENGINE_PID" -o %cpu= | tr -d "[:space:]")"
+echo "idle cpu=$cpu"
+python3 -c 'import sys; raise SystemExit(0 if float(sys.argv[1]) < 0.5 else 1)' "$cpu"
+echo "e2e step 7 ok"
+
 kill -TERM "$ENGINE_PID"
 wait "$ENGINE_PID" || true
 ENGINE_PID=""

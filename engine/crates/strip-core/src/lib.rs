@@ -4,6 +4,7 @@
 mod layout;
 mod model;
 mod params;
+mod spring;
 
 pub use layout::{
     crosses_display, layout, observe_size, overlap, parked_corner, sliver_used, Corner, Placement,
@@ -11,6 +12,7 @@ pub use layout::{
 };
 pub use model::{Column, ColumnId, DisplayMode, Focus, Pinned, Strip, Window, WindowId};
 pub use params::{DisplayFrame, Frame, LayoutParams, Viewport};
+pub use spring::Spring;
 
 #[cfg(test)]
 mod props;

@@ -3,6 +3,7 @@
 use std::cell::Cell;
 use std::os::raw::{c_void, c_uint};
 use std::ptr;
+use std::sync::atomic::{AtomicPtr, Ordering};
 
 
 use crate::bindings::Binding;
@@ -23,6 +24,24 @@ const FLAG_COMMAND: u64 = 0x0010_0000;
 thread_local! {
     static CONTEXT: Cell<*mut TapContext> = const { Cell::new(ptr::null_mut()) };
     static TAP_PORT: Cell<*mut c_void> = const { Cell::new(ptr::null_mut()) };
+}
+
+static MAIN_LOOP: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
+
+pub fn remember_main_loop() {
+    let run_loop = unsafe { CFRunLoopGetMain() };
+    MAIN_LOOP.store(run_loop, Ordering::SeqCst);
+}
+
+pub fn main_loop() -> *mut c_void {
+    MAIN_LOOP.load(Ordering::SeqCst)
+}
+
+pub fn wake_main() {
+    let run_loop = MAIN_LOOP.load(Ordering::SeqCst);
+    if !run_loop.is_null() {
+        unsafe { CFRunLoopWakeUp(run_loop) };
+    }
 }
 
 struct TapContext {
@@ -164,6 +183,8 @@ extern "C" {
     static kCFRunLoopCommonModes: *const c_void;
     fn CFMachPortCreateRunLoopSource(allocator: *const c_void, port: *mut c_void, order: c_uint) -> *mut c_void;
     fn CFRunLoopGetCurrent() -> *mut c_void;
+    fn CFRunLoopGetMain() -> *mut c_void;
     fn CFRunLoopAddSource(run_loop: *mut c_void, source: *mut c_void, mode: *const c_void);
     fn CFRunLoopRunInMode(mode: *const c_void, seconds: f64, return_after_source: u8) -> i32;
+    fn CFRunLoopWakeUp(run_loop: *mut c_void);
 }
