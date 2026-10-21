@@ -101,6 +101,22 @@ pub fn parked_corner(
     (corner, sliver_used(gap_outer, sliver))
 }
 
+/// A window that keeps a wider size than its column gets a column that fits
+/// it, so the strip lays out around it instead of overlapping the neighbour.
+pub fn column_width(column: &crate::model::Column, viewport_width: f64) -> f64 {
+    let base = column.width_ratio * viewport_width;
+    column
+        .windows
+        .iter()
+        .filter_map(|window| window.size_override.map(|(width, _)| width))
+        .fold(base, f64::max)
+}
+
+/// Width the columns scroll through: the viewport less outer gaps and pins.
+pub fn scroll_width(strip: &Strip, params: &LayoutParams, visible: Viewport) -> f64 {
+    metrics(strip, params, visible).vw
+}
+
 pub(crate) struct Metrics {
     pub vx: f64,
     pub vy: f64,
@@ -118,18 +134,18 @@ pub(crate) fn metrics(strip: &Strip, params: &LayoutParams, visible: Viewport) -
     let vy = visible.y + params.gap_outer;
     let mut vw = inner_w;
     if let Some(pin) = &strip.pinned_left {
-        let width = pin.column.width_ratio * visible.width;
+        let width = column_width(&pin.column, visible.width);
         vx += width + params.gap_inner;
         vw = (vw - width - params.gap_inner).max(0.0);
     }
     if let Some(pin) = &strip.pinned_right {
-        let width = pin.column.width_ratio * visible.width;
+        let width = column_width(&pin.column, visible.width);
         vw = (vw - width - params.gap_inner).max(0.0);
     }
     let widths: Vec<f64> = strip
         .columns
         .iter()
-        .map(|column| column.width_ratio * visible.width)
+        .map(|column| column_width(column, visible.width))
         .collect();
     let mut prefixes = Vec::with_capacity(widths.len());
     let mut cursor = 0.0;
@@ -166,7 +182,7 @@ pub fn layout(
     };
     let mut placed = Vec::new();
     if let Some(pin) = &strip.pinned_left {
-        let frame = pin_frame(Side::Left, pin.column.width_ratio * visible.width, visible, params);
+        let frame = pin_frame(Side::Left, column_width(&pin.column, visible.width), visible, params);
         place_column(&mut placed, &pin.column, frame, Visibility::Visible, Side::Left, display, params);
     }
     for (index, column) in strip.columns.iter().enumerate() {
@@ -186,7 +202,7 @@ pub fn layout(
         place_column(&mut placed, column, frame, visibility, side, display, params);
     }
     if let Some(pin) = &strip.pinned_right {
-        let frame = pin_frame(Side::Right, pin.column.width_ratio * visible.width, visible, params);
+        let frame = pin_frame(Side::Right, column_width(&pin.column, visible.width), visible, params);
         place_column(&mut placed, &pin.column, frame, Visibility::Visible, Side::Right, display, params);
     }
     placed
@@ -246,9 +262,13 @@ fn parked_placement(
     );
     let width = window.size_override.map(|(w, _)| w).unwrap_or(natural.width).max(sliver);
     let height = window.size_override.map(|(_, h)| h).unwrap_or(natural.height).max(sliver);
-    let (x, y) = match corner {
-        Corner::BottomRight => (display.max_x - sliver, display.max_y - sliver),
-        Corner::BottomLeft => (display.min_x - width + sliver, display.max_y - sliver),
+    // Keep the window on the strip's row. Parking at the bottom corner makes
+    // macOS clamp the title bar back on screen, so the full window jumps down
+    // and piles on top of the others.
+    let y = natural.y;
+    let x = match corner {
+        Corner::BottomRight => display.max_x - sliver,
+        Corner::BottomLeft => display.min_x - width + sliver,
     };
     Placement {
         window: window.id,
@@ -489,8 +509,9 @@ mod tests {
         assert_eq!(by_id(2).visibility, Visibility::Visible);
         assert_eq!(by_id(1).visibility, Visibility::Hidden);
         assert_eq!(by_id(3).visibility, Visibility::Hidden);
-        let (w, h) = overlap(by_id(1).frame, display);
-        assert!(w <= 5.0 + 1e-6 && h <= 5.0 + 1e-6);
+        let (w, _) = overlap(by_id(1).frame, display);
+        assert!(w <= 5.0 + 1e-6);
+        assert!((by_id(1).frame.y - by_id(2).frame.y).abs() < 1e-6);
     }
 
     #[test]

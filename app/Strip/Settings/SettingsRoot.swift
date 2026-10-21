@@ -134,6 +134,9 @@ private struct LayoutSection: View {
                 Text("Always").tag("always")
             }
             Toggle("Keep original height", isOn: bool(\.keepOriginalHeight))
+            Toggle("Focus follows mouse", isOn: bool(\.focusFollowsMouse))
+            Toggle("Mouse follows focus", isOn: bool(\.mouseFollowsFocus))
+            Toggle("Drag title bar to reorder", isOn: bool(\.dragToReorder))
         }
         .formStyle(.grouped)
     }
@@ -544,7 +547,7 @@ enum DisplayCatalog {
         NSScreen.screens.compactMap { screen in
             guard let number = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber else { return nil }
             let display = CGDirectDisplayID(number.uint32Value)
-            return Row(id: uuidString(display), name: screen.localizedName)
+            return Row(id: displayUUID(display), name: screen.localizedName)
         }
     }
 }
@@ -552,7 +555,7 @@ enum DisplayCatalog {
 @_silgen_name("CGDisplayCreateUUIDFromDisplayID")
 private func copyDisplayUUID(_ display: UInt32) -> Unmanaged<CFUUID>?
 
-private func uuidString(_ display: CGDirectDisplayID) -> String {
+func displayUUID(_ display: CGDirectDisplayID) -> String {
     guard let uuid = copyDisplayUUID(display)?.takeRetainedValue() else {
         return String(display)
     }

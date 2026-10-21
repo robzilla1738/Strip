@@ -58,7 +58,9 @@ pub struct DisplayInfo {
 }
 
 struct Element(*mut c_void);
+// AXUIElement calls are mach messages to the target app and may run from any thread.
 unsafe impl Send for Element {}
+unsafe impl Sync for Element {}
 
 pub struct AxApi {
     windows: HashMap<u64, Element>,
@@ -68,6 +70,9 @@ pub struct AxApi {
     /// this window id as the `_AXUIElementGetWindow` match. Production leaves it unset.
     #[cfg(test)]
     pub remote_match: Option<u64>,
+    /// Frames `read_frame` returns for windows with no element.
+    #[cfg(test)]
+    pub frames: HashMap<u64, Frame>,
 }
 
 impl AxApi {
@@ -87,6 +92,8 @@ impl AxApi {
             get_window,
             #[cfg(test)]
             remote_match: None,
+            #[cfg(test)]
+            frames: HashMap::new(),
         }
     }
 
@@ -107,35 +114,39 @@ impl AxApi {
 }
 
 impl WindowApi for AxApi {
-    fn write_size(&mut self, window: u64, width: f64, height: f64) {
+    fn write_size(&self, window: u64, width: f64, height: f64) {
         let Some(element) = self.windows.get(&window).map(|element| element.0) else {
             return;
         };
         unsafe { set_size(element, width, height) };
     }
 
-    fn write_position(&mut self, window: u64, x: f64, y: f64) {
+    fn write_position(&self, window: u64, x: f64, y: f64) {
         let Some(element) = self.windows.get(&window).map(|element| element.0) else {
             return;
         };
         unsafe { set_position(element, x, y) };
     }
 
-    fn read_frame(&mut self, window: u64) -> Frame {
+    fn read_frame(&self, window: u64) -> Frame {
+        #[cfg(test)]
+        if let Some(frame) = self.frames.get(&window) {
+            return *frame;
+        }
         let Some(element) = self.windows.get(&window).map(|element| element.0) else {
             return Frame { x: 0.0, y: 0.0, width: 0.0, height: 0.0 };
         };
         unsafe { read_frame(element) }
     }
 
-    fn enhanced_ui(&mut self, pid: i32) -> bool {
+    fn enhanced_ui(&self, pid: i32) -> bool {
         let Some(app) = self.apps.get(&pid).map(|element| element.0) else {
             return false;
         };
         unsafe { copy_bool(app, "AXEnhancedUserInterface") }
     }
 
-    fn set_enhanced_ui(&mut self, pid: i32, enabled: bool) {
+    fn set_enhanced_ui(&self, pid: i32, enabled: bool) {
         let Some(app) = self.apps.get(&pid).map(|element| element.0) else {
             return;
         };
@@ -159,6 +170,29 @@ pub fn raise(api: &AxApi, window: u64, pid: i32) -> bool {
         let front = set_attr(app, "AXFrontmost", kCFBooleanTrue) == 0;
         raised && front
     }
+}
+
+/// The window id of the app's `AXFocusedWindow`, when `_AXUIElementGetWindow` is available.
+pub fn focused_window(api: &AxApi, pid: i32) -> Option<u64> {
+    let get_window = api.get_window?;
+    let cached = api.apps.get(&pid).map(|element| element.0);
+    let created = cached.is_none();
+    let app = match cached {
+        Some(app) => app,
+        None => app_element(pid)?,
+    };
+    let mut id = 0u32;
+    let found = unsafe {
+        let mut value = std::ptr::null();
+        let ok = copy_attr(app, "AXFocusedWindow", &mut value) == 0 && !value.is_null();
+        let matched = ok && get_window(value as *mut c_void, &mut id) == 0;
+        cf_release(value);
+        matched
+    };
+    if created {
+        unsafe { cf_release(app) };
+    }
+    (found && id != 0).then_some(u64::from(id))
 }
 
 pub fn activate(pid: i32) {
@@ -193,6 +227,17 @@ impl Default for Traits {
 }
 
 impl AxApi {
+    pub fn knows(&self, id: u64) -> bool {
+        self.windows.contains_key(&id)
+    }
+
+    /// Drops the element of a window that left every strip.
+    pub fn forget(&mut self, id: u64) {
+        if let Some(element) = self.windows.remove(&id) {
+            unsafe { cf_release(element.0) };
+        }
+    }
+
     pub fn describe(&self, id: u64) -> Traits {
         let Some(element) = self.windows.get(&id).map(|element| element.0) else {
             return Traits::default();

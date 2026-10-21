@@ -20,15 +20,20 @@ enum IpcFailure: Error, CustomStringConvertible {
 
 /// Line-framed JSON over a Unix-domain `NWConnection`.
 final class IpcClient {
-    private let queue = DispatchQueue(label: "ipc.client")
+    private let queue = DispatchQueue(label: "ipc.client", qos: .userInteractive)
+    /// Guards `connection`, `token`, `nextID` and `waiters`.
     private let lock = NSLock()
     private let turn = NSLock()
     private var connection: NWConnection?
+    /// Only touched on `queue`.
     private var buffer = Data()
     private var nextID: UInt64 = 1
     private var token = 0
     private var waiters: [UInt64: (Result<WireLine, Error>) -> Void] = [:]
+    /// Called on the client queue for every event line.
     var onEvent: ((WireLine) -> Void)?
+    /// Called on the client queue when the engine drops the stream. Not called after `close()`.
+    var onClose: ((Error) -> Void)?
 
     func open(socketPath: String, client: String) throws -> WireLine {
         try connect(socketPath)
@@ -62,9 +67,13 @@ final class IpcClient {
     }
 
     func close() {
+        lock.lock()
         token += 1
-        connection?.cancel()
+        let current = connection
         connection = nil
+        lock.unlock()
+        current?.cancel()
+        failAll(IpcFailure.disconnected("closed"))
     }
 
     /// A nil transport fails to attach to a BSD Unix listener (`null protocol_parameters`).
@@ -77,33 +86,50 @@ final class IpcClient {
     }
 
     private func connect(_ path: String) throws {
+        lock.lock()
         token += 1
         let token = token
-        connection?.cancel()
-        buffer.removeAll()
+        let previous = connection
+        connection = nil
+        lock.unlock()
+        previous?.cancel()
+        queue.sync { buffer.removeAll() }
         let ready = Box<String>()
         let conn = NWConnection(to: .unix(path: path), using: Self.unixParameters())
-        conn.stateUpdateHandler = { state in
+        conn.stateUpdateHandler = { [weak self] state in
             switch state {
             case .ready:
                 ready.put("ready")
+            case .waiting(let error):
+                // A missing or refused socket parks the connection in `.waiting`; fail now so the caller can retry.
+                ready.put("failed:\(error)")
             case .failed(let error):
                 ready.put("failed:\(error)")
+                self?.ended(token: token, error: error)
             case .cancelled:
                 ready.put("failed:cancelled")
             default:
                 break
             }
         }
-        connection = conn
         conn.start(queue: queue)
         guard let state = ready.wait(seconds: 2) else {
+            conn.cancel()
             throw IpcFailure.timedOut
         }
         guard state == "ready" else {
+            conn.cancel()
             throw IpcFailure.disconnected(state)
         }
-        receive(token: token)
+        lock.lock()
+        guard token == self.token else {
+            lock.unlock()
+            conn.cancel()
+            throw IpcFailure.disconnected("superseded")
+        }
+        connection = conn
+        lock.unlock()
+        receive(on: conn, token: token)
     }
 
     private func roundTrip<T: Encodable>(_ body: T, id: UInt64, timeout: TimeInterval = 3) throws -> WireLine {
@@ -112,11 +138,12 @@ final class IpcClient {
         let payload = try JSONEncoder().encode(body) + Data([0x0A])
         let box = Box<Result<WireLine, Error>>()
         lock.lock()
-        waiters[id] = { box.put($0) }
-        lock.unlock()
         guard let connection else {
+            lock.unlock()
             throw IpcFailure.disconnected("no connection")
         }
+        waiters[id] = { box.put($0) }
+        lock.unlock()
         connection.send(content: payload, completion: .contentProcessed { [weak self] error in
             if let error {
                 self?.deliver(id: id, result: .failure(error))
@@ -138,35 +165,52 @@ final class IpcClient {
         return nextID
     }
 
-    private func receive(token: Int) {
-        connection?.receive(minimumIncompleteLength: 1, maximumLength: 65_536) { [weak self] data, _, isComplete, error in
-            guard let self, token == self.token else { return }
+    private func isCurrent(_ token: Int) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return token == self.token
+    }
+
+    private func receive(on conn: NWConnection, token: Int) {
+        conn.receive(minimumIncompleteLength: 1, maximumLength: 262_144) { [weak self] data, _, isComplete, error in
+            guard let self, self.isCurrent(token) else { return }
             if let data, !data.isEmpty {
                 self.consume(data)
             }
             if let error {
-                self.failAll(error)
+                self.ended(token: token, error: error)
                 return
             }
             if isComplete {
-                self.failAll(IpcFailure.disconnected("closed"))
+                self.ended(token: token, error: IpcFailure.disconnected("closed"))
                 return
             }
-            self.receive(token: token)
+            self.receive(on: conn, token: token)
         }
+    }
+
+    private func ended(token: Int, error: Error) {
+        lock.lock()
+        guard token == self.token else {
+            lock.unlock()
+            return
+        }
+        self.token += 1
+        let current = connection
+        connection = nil
+        lock.unlock()
+        current?.cancel()
+        failAll(error)
+        onClose?(error)
     }
 
     private func consume(_ data: Data) {
         buffer.append(data)
-        if buffer.count > 1 << 20 {
-            failAll(IpcFailure.badLine("line exceeds 1 MiB"))
-            buffer.removeAll()
-            return
-        }
-        while let newline = buffer.firstIndex(of: 0x0A) {
-            let chunk = buffer.prefix(upTo: newline)
-            buffer.removeSubrange(...newline)
-            guard !chunk.isEmpty, let line = try? JSONDecoder().decode(WireLine.self, from: Data(chunk)) else {
+        var start = buffer.startIndex
+        while let newline = buffer[start...].firstIndex(of: 0x0A) {
+            let chunk = buffer[start..<newline]
+            start = buffer.index(after: newline)
+            guard !chunk.isEmpty, let line = WireLine.parse(Data(chunk)) else {
                 continue
             }
             if line.type == "event" {
@@ -174,6 +218,11 @@ final class IpcClient {
             } else if let id = line.id {
                 deliver(id: id, result: .success(line))
             }
+        }
+        buffer.removeSubrange(buffer.startIndex..<start)
+        if buffer.count > 1 << 20 {
+            buffer.removeAll()
+            failAll(IpcFailure.badLine("line exceeds 1 MiB"))
         }
     }
 
@@ -195,32 +244,27 @@ final class IpcClient {
     }
 }
 
+/// One-shot value handoff: the first `put` wins and wakes the waiter.
 private final class Box<T> {
     private let lock = NSLock()
+    private let signal = DispatchSemaphore(value: 0)
     private var value: T?
 
     func put(_ value: T) {
         lock.lock()
-        if self.value == nil {
-            self.value = value
+        guard self.value == nil else {
+            lock.unlock()
+            return
         }
+        self.value = value
         lock.unlock()
+        signal.signal()
     }
 
     func wait(seconds: TimeInterval) -> T? {
-        let deadline = Date().addingTimeInterval(seconds)
-        while Date() < deadline {
-            lock.lock()
-            let current = value
-            lock.unlock()
-            if let current {
-                return current
-            }
-            Thread.sleep(forTimeInterval: 0.01)
-        }
+        _ = signal.wait(timeout: .now() + seconds)
         lock.lock()
-        let current = value
-        lock.unlock()
-        return current
+        defer { lock.unlock() }
+        return value
     }
 }

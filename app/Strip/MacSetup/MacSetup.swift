@@ -18,10 +18,39 @@ struct SetupCheck: Equatable, Identifiable {
 }
 
 enum FixLink {
-    static let accessibility = "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"
+    /// Privacy & Security anchor. The label is Accessibility through macOS 26 and
+    /// Device Control and Data Access on macOS 27. The sidebar item named
+    /// Accessibility is a different pane.
+    static let accessibility = "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_Accessibility"
     static let trackpad = "x-apple.systempreferences:com.apple.Trackpad-Settings.extension"
     static let desktop = "x-apple.systempreferences:com.apple.Desktop-Settings.extension"
     static let displays = "x-apple.systempreferences:com.apple.Displays-Settings.extension"
+}
+
+enum ControlAccess {
+    static func paneName(major: Int) -> String {
+        major >= 27 ? "Device Control and Data Access" : "Accessibility"
+    }
+
+    static var paneName: String {
+        paneName(major: ProcessInfo.processInfo.operatingSystemVersion.majorVersion)
+    }
+
+    static var settingsURL: URL {
+        URL(string: FixLink.accessibility)!
+    }
+
+    /// Asks macOS to show its own permission alert, which uses the current pane name.
+    @discardableResult
+    static func prompt() -> Bool {
+        let key = kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String
+        return AXIsProcessTrustedWithOptions([key: true] as CFDictionary)
+    }
+
+    static func openSettings() {
+        prompt()
+        NSWorkspace.shared.open(settingsURL)
+    }
 }
 
 enum MacSetup {
@@ -33,9 +62,9 @@ enum MacSetup {
     static func accessibility(appTrusted: Bool, engineTrusted: Bool) -> SetupCheck {
         check(
             "accessibility",
-            "Accessibility",
+            ControlAccess.paneName,
             appTrusted && engineTrusted,
-            "Allow this app in Privacy & Security → Accessibility.",
+            "Allow this app in Privacy & Security → \(ControlAccess.paneName).",
             FixLink.accessibility
         )
     }
@@ -149,7 +178,7 @@ enum MacSetup {
 
     static var guide: String {
         """
-        Accessibility — Privacy & Security → Accessibility. Fix opens \(FixLink.accessibility).
+        \(ControlAccess.paneName) — Privacy & Security → \(ControlAccess.paneName). Fix opens \(FixLink.accessibility).
         Four-finger swipe — set Swipe between full-screen applications to Off. Fix opens \(FixLink.trackpad).
         Three-finger swipe — full-screen swipe on four fingers, page swipe on two fingers, Three Finger Drag off. Fix opens \(FixLink.trackpad).
         Separate Spaces — Displays have separate Spaces on, then log out. Fix opens \(FixLink.desktop).
@@ -256,7 +285,11 @@ struct MacSetupList: View {
                         Text(item.instruction).font(.callout).foregroundStyle(.secondary)
                         if !item.passed, let url = item.fixURL {
                             Button(item.warnOnly ? "Show arrangement" : "Fix") {
-                                NSWorkspace.shared.open(URL(string: url)!)
+                                if item.id == "accessibility" {
+                                    ControlAccess.openSettings()
+                                } else if let destination = URL(string: url) {
+                                    NSWorkspace.shared.open(destination)
+                                }
                             }
                         }
                         if !item.passed && !item.quit.isEmpty {

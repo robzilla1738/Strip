@@ -22,11 +22,11 @@ struct ConfigDocument: Equatable {
     var dockAware = true
     var centerMode = "never"
     var keepOriginalHeight = false
-    var animationDurationMs = 500
+    var animationDurationMs = 250
     var animationDamping = 0.9
     var swipeFingers = 4
     var swipeNatural = true
-    var swipeSensitivity = 1.0
+    var swipeSensitivity = 1.5
     var swipeDeceleration = 4.0
     var focusFollowsMouse = false
     var mouseFollowsFocus = false

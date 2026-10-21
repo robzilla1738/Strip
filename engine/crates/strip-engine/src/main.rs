@@ -130,7 +130,11 @@ fn main() -> ExitCode {
         trusted,
     );
     wake::install();
-    let tap = hotkeys::install();
+    let mut tap = hotkeys::install();
+    if tap.is_none() {
+        eprintln!("event tap unavailable; retrying until Accessibility is granted");
+    }
+    let mut tap_retry = Instant::now();
     hotkeys::remember_main_loop();
     watch::install_reload_source();
     let _config_watch = match cli.config.as_ref() {
@@ -144,51 +148,108 @@ fn main() -> ExitCode {
         None => None,
     };
     runtime.tick();
-    write_state(&cli, &snapshot, &bus);
-    let mut next_tick = Instant::now() + Duration::from_millis(80);
+    let mut persist = Persist::new(cli.state.clone());
+    command::flush_state(&runtime, &bus);
+    persist.save(&runtime, &snapshot);
+    let mut next_tick = Instant::now() + TICK_IDLE;
+    let mut wake_at: Option<Instant> = None;
     loop {
         if lifecycle::stop_requested() {
-            runtime.unpark_all();
-            write_state(&cli, &snapshot, &bus);
             break;
         }
         if wake::take_space_change() {
             runtime.switch_space();
         }
         if wake::take_request() {
+            wake_at = Some(Instant::now() + WAKE_SETTLE);
+        }
+        if wake_at.is_some_and(|due| Instant::now() >= due) {
+            wake_at = None;
             runtime.resync_after_wake();
         }
         if watch::take_dirty() {
-            apply_config(&mut runtime, &cli, &snapshot, &bus);
+            apply_config(&mut runtime);
         }
-        // The tap callback runs on this thread while the run loop is pumping.
-        // Idle waits are long; IPC, the tap, and the display link wake this thread.
-        let slice = if runtime.is_animating() { 0.02 } else { 1.0 };
+        command::flush_state(&runtime, &bus);
+        // The tap callbacks run on this thread while the run loop is pumping.
+        // IPC, wake notices, config changes, and each display-link frame stop the
+        // run loop, so the slice only bounds the wait for the next timed job.
+        let mut deadline = wake_at.map_or(next_tick, |due| due.min(next_tick));
+        // Discovery waits while fingers are on the trackpad, so the slice
+        // follows the swipe timeout instead of the tick.
+        if let Some(due) = runtime.swipe_deadline() {
+            deadline = wake_at.map_or(due, |wake| wake.min(due));
+        }
+        let slice = deadline.saturating_duration_since(Instant::now()).as_secs_f64().min(1.0);
         hotkeys::pump(&mut runtime, &bus, slice);
+        runtime.expire_swipe();
         runtime.drain_frames();
+        if tap.is_none() && tap_retry.elapsed() >= TAP_RETRY {
+            tap_retry = Instant::now();
+            if ax::trusted() {
+                tap = hotkeys::install();
+                if tap.is_some() {
+                    runtime.set_trusted(true);
+                    eprintln!("event tap installed");
+                }
+            }
+        }
         let _ = tap.as_ref().map(hotkeys::EventTap::alive);
         for job in bus.poll(Duration::from_millis(0)) {
             let response = dispatch(&mut runtime, &bus, job.message);
             let _ = job.reply.send(response);
         }
-        runtime.drain_frames();
-        if watch::take_dirty() {
-            apply_config(&mut runtime, &cli, &snapshot, &bus);
-        }
-        if lifecycle::stop_requested() {
-            runtime.unpark_all();
-            write_state(&cli, &snapshot, &bus);
-            break;
-        }
-        if Instant::now() >= next_tick {
+        if Instant::now() >= next_tick && runtime.swipe_deadline().is_none() {
             runtime.tick();
-            write_state(&cli, &snapshot, &bus);
-            let period = if runtime.is_animating() { 80 } else { 1000 };
-            next_tick = Instant::now() + Duration::from_millis(period);
+            // Window discovery waits while the strip is in motion so frames stay on time.
+            next_tick = Instant::now() + if runtime.is_animating() { TICK_ANIMATING } else { TICK_IDLE };
         }
+        command::flush_state(&runtime, &bus);
+        persist.maybe_save(&runtime, &snapshot);
     }
+    runtime.unpark_all();
+    command::flush_state(&runtime, &bus);
+    persist.save(&runtime, &snapshot);
     let _ = cli.log;
     ExitCode::SUCCESS
+}
+
+const TICK_IDLE: Duration = Duration::from_millis(1000);
+const TICK_ANIMATING: Duration = Duration::from_millis(600);
+const WAKE_SETTLE: Duration = Duration::from_millis(1500);
+const TAP_RETRY: Duration = Duration::from_secs(2);
+const PERSIST_EVERY: Duration = Duration::from_secs(2);
+
+/// Writes `state.json` every 2 s when the state changed, and on exit.
+struct Persist {
+    path: Option<PathBuf>,
+    saved_version: Option<u64>,
+    saved_at: Instant,
+}
+
+impl Persist {
+    fn new(path: Option<PathBuf>) -> Self {
+        Self { path, saved_version: None, saved_at: Instant::now() }
+    }
+
+    fn maybe_save(&mut self, runtime: &Runtime, snapshot: &Mutex<String>) {
+        if self.saved_version != Some(runtime.state_version()) && self.saved_at.elapsed() >= PERSIST_EVERY {
+            self.save(runtime, snapshot);
+        }
+    }
+
+    fn save(&mut self, runtime: &Runtime, snapshot: &Mutex<String>) {
+        self.saved_version = Some(runtime.state_version());
+        self.saved_at = Instant::now();
+        let Some(path) = self.path.as_ref() else {
+            return;
+        };
+        let text = snapshot.lock().unwrap_or_else(|err| err.into_inner()).clone();
+        let staging = path.with_extension("json.tmp");
+        if std::fs::write(&staging, text).is_ok() {
+            let _ = std::fs::rename(&staging, path);
+        }
+    }
 }
 
 fn dispatch(runtime: &mut Runtime, bus: &Bus, message: ClientMessage) -> String {
@@ -219,23 +280,10 @@ fn reply(message: &ServerMessage) -> String {
     encode(message).trim_end().to_string()
 }
 
-fn apply_config(runtime: &mut Runtime, cli: &Cli, snapshot: &Mutex<String>, bus: &Bus) {
+fn apply_config(runtime: &mut Runtime) {
     if let Err(err) = runtime.reload() {
         eprintln!("config reload: {err}");
         return;
     }
     runtime.tick();
-    write_state(cli, snapshot, bus);
-}
-
-fn write_state(cli: &Cli, snapshot: &Mutex<String>, bus: &Bus) {
-    let Some(path) = cli.state.as_ref() else {
-        return;
-    };
-    if let Ok(text) = snapshot.lock() {
-        let _ = std::fs::write(path, &*text);
-        if let Ok(value) = serde_json::from_str(text.as_str()) {
-            bus.emit("state", value);
-        }
-    }
 }

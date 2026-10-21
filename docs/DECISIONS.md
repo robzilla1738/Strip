@@ -82,13 +82,51 @@ A `--dialog` fixture is an `NSPanel` with the utility style. On this OS that pan
 
 ## Session restore and wake
 
-`state.json` is the query snapshot written on each tick and on exit. Launch matches windows for 10 seconds with `restore::match_windows`: `(CGWindowID, pid)` first, then a unique `(bundle, title, role, subrole)`. An ambiguous title matches nothing. Restored columns keep their saved width and are placed without a spring.
+`state.json` is the query snapshot, written every 2 s when it changed and on exit, through a temporary file and a rename. Launch matches windows for 10 seconds with `restore::match_windows`: `(CGWindowID, pid)` first, then a unique `(bundle, title, role, subrole)`. An ambiguous title matches nothing. Restored columns keep their saved width and are placed without a spring.
 
 Wake and unlock notifications set a flag. `NSWorkspaceDidWakeNotification` and `NSWorkspaceScreensDidWakeNotification` are observed on `NSWorkspace.notificationCenter`. `com.apple.screenIsUnlocked` stays on the distributed center. `CGDisplayRegisterReconfigurationCallback` requests the same resync and ignores the begin flag. The main thread, and `strip debug simulate_wake`, wait 1.5 seconds, re-enumerate windows, and re-apply frames with the springs snapped. When SkyLight is loaded the active Space is read again. When it is missing, wake keeps the fallback hash from `switch_space` so the strip key does not become `1`. The existing event tap is enabled again. A second tap is not created, because it would swallow each key twice. A Space change does not take that 1.5 second path. `NSWorkspaceActiveSpaceDidChangeNotification` calls `switch_space`.
 
 Strips are keyed by `(display UUID, Space id)` when SkyLight is loaded. The active Space comes from `SLSGetActiveSpace`. On-screen windows stay on that Space. Off-screen windows are assigned with `SLSCopySpacesForWindows` and `SLSCopyWindowsWithOptionsAndTags`. An empty Accessibility role is resolved with `_AXUIElementCreateWithRemoteToken`. When that constructor matches the window and the role is still empty, the window is admitted as a standard window and inserted on its Space. A fullscreen Space (type 4) stays out of the strips. Without SkyLight the key is display-only until `activeSpaceDidChange`, which then stores `fallback_space_key` and does not rehash on every tick. Wake does not call `current_space()` on that path, so the hash is not replaced with `1`.
 
 Focus commands call `AXRaise` and `AXFrontmost`. If that fails, `_SLPSSetFrontProcessWithOptions` and `SLPSPostEventRecordTo` run, then the process is activated. The writer feeds each size read-back to `observe_size`. Two identical misses store `size_override`. After a park, a read-back whose center is on another display calls `repair_relocated`, republishes with `s = 1` at the opposite corner, and marks that side as a neighbour for the session. The next `repair_park` returns that 1 pt frame. It does not return `None` and let the 5 pt layout through. Removing a window passes that display's real viewport into `reveal`.
+
+## Parked windows stay on the strip row
+
+Section 2.6 parks a fully hidden window at the bottom corner, with only a sliver on the display. On macOS 27 the window server then pulls the title bar back on screen, so the window jumps to the bottom edge and several hidden windows pile on the same corner. `parked_placement` keeps the column's Y and height and only shifts X, so the window slides off the side of the strip. The on-screen remainder is still `sliver` points wide. A later repair keeps that Y.
+
+## Control access pane
+
+macOS 27 renames the Privacy & Security list that used to be called Accessibility. The list is now Device Control and Data Access. The sidebar item still named Accessibility is the user feature pane (VoiceOver, Zoom, Pointer Control) and does not grant window control. `ControlAccess.paneName` uses the new name from major version 27 and Accessibility before that. The Fix link is `x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_Accessibility`. The anchor is unchanged. On this OS that URL opens a window titled Device Control and Data Access. The app also calls `AXIsProcessTrustedWithOptions` with the prompt key so the system alert uses the current name, then restarts the engine once after the grant so the event tap is created.
+
+## Main loop pacing
+
+`CFRunLoopWakeUp` does not return from `CFRunLoopRunInMode`, so IPC commands, wake notices, and display-link frames call `CFRunLoopStop` through `hotkeys::wake_main`. A stop that lands between pumps makes the next pump return at once, so no wakeup is lost. The pump slice is the time to the next tick or wake resync. Window discovery ticks every 1 s at rest and every 600 ms while the strip animates; a faster idle tick costs measurable idle CPU. The 1.5 s wake settle is a deadline in the loop, not a sleep, so the event taps keep running.
+
+State events go out once per change. `publish_state` bumps a version only when the JSON text differs, and `command::flush_state` sends the text as is with `Bus::emit_raw`.
+
+## Event taps
+
+Only key-downs use an active tap, because a matched shortcut is swallowed. Mouse, modifier, and gesture events use a listen-only tap, so the system never waits on the engine thread to deliver them. The ⌃⌥ hold is announced only when it changes.
+
+## Writer concurrency
+
+The AX element cache sits behind an `RwLock`. Per-pid writers share the read side, so one slow app no longer delays the others. Element resolution takes the write side. `AXEnhancedUserInterface` is read once per burst of writes and the result is remembered until the 250 ms restore. Position-only animation frames skip the read-back. Element resolution copies `AXWindows` only for apps with an unknown window and retries a window that does not resolve every 2 s.
+
+## Swipe tracking
+
+While the fingers move, windows are snapped to the strip with position-only writes, with no spring, so tracking is 1:1. Velocity uses the real event spacing. On lift, the strip's scroll spring starts with the finger velocity, capped at 9,000 pt/s, so the strip keeps its momentum. A pause of more than 80 ms before lift drops the velocity. The snapped column is raised.
+
+## Swipe timeout
+
+A swipe with no gesture event for 300 ms is ended and snapped. macOS stops sending gesture events when it takes a gesture over (Mission Control, Spaces), and the strip used to stay mid-swipe. If the fingers keep moving after the timeout, the swipe resumes from the current scroll.
+
+## Stubborn sizes after the write
+
+Some apps accept a size write and then put their own size back later, so the read-back right after the write misses them. Each tick compares the window list size with the target for settled, visible windows. The first mismatch writes the frame again. A second mismatch of the same size stores it as the window's size, and the column is made wide enough for it (`column_width`), so the window no longer overlaps its neighbour.
+
+## Strip motion
+
+Each strip has one scroll spring; `scroll_x` is its target. Every frame lays the strip out again at the spring's current scroll, so all columns move as one body. Window springs run in strip coordinates (screen x plus scroll), so they only move for structural changes such as a reorder, a width change, or an insert. A column that slides fully out of the viewport is parked on that frame. A parked column that comes back starts at its own place on the strip, not at its park. Earlier, windows springed one by one between screen frames, so a leaving column jumped to its park at once and an arriving one flew in from the edge.
 
 ## App private symbols
 
@@ -153,3 +191,35 @@ Section 4.6 drops a license as soon as validation returns `valid: false`. The st
 ## Definition-of-done search roots
 
 `scripts/dod.sh` searches shipped sources (`engine/crates`, `app`, `tools`, `integrations`, `scripts`). It does not flag `TODO` comments inside the unmodified `engine/upstream` snapshot.
+
+## Swipe touches and snap stops
+
+Once a swipe is armed, a touch that lands (a resting thumb or palm) joins the
+finger stream instead of restarting the gesture; before that, a new touch still
+restarts recognition so the finger count is right. While the fingers move, the
+state JSON goes out at most every 33 ms and metrics are not rebuilt; the release
+always publishes. Swipe snap stops follow the centre mode: with `never` (the
+default) a stop lines up a column's left edge with the viewport's left edge or
+its right edge with the right edge, so whole columns show, as the keyboard
+leaves them. Limits and stops use the scroll width (viewport less outer gaps and
+pins), the same width the layout uses.
+
+## Hand resizing
+
+A mouse press within 6 pt of a managed window is remembered. On release, if the
+pointer moved, the window's AX frame is read once; a size change over 4 pt makes
+the column take that width (ratio of the visible width, 0.1–1.0), drops any size
+override, focuses and reveals the column, and lays the strip out at once so the
+neighbours glide into place. Without this, the next tick wrote the old size back
+before the stubborn-size check accepted the new one.
+
+## Event tap retry and swipe-time discovery
+
+The event tap cannot be created before Accessibility is granted. The engine
+retries every 2 s while it has no tap and, once Accessibility is trusted,
+installs it and accepts commands, so shortcuts and swipes start working without
+an engine restart. Window discovery (the tick) waits while fingers are on the
+trackpad, and each gesture frame is read inside its own autorelease pool because
+the tap runs outside AppKit's event loop. A swipe scrolls the display under the
+pointer. `scripts/shortcuts.sh` presses every default shortcut as a real key
+event and checks the result.

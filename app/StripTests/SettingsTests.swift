@@ -30,6 +30,26 @@ final class SettingsTests: XCTestCase {
         XCTAssertFalse(ShortcutCodec.translated(4).isEmpty)
     }
 
+    func testTileFocusFollowsPinnedColumns() {
+        XCTAssertTrue(tileIsFocused(focus: "pinned_left", focusedColumn: 0, pin: .left, column: -1))
+        XCTAssertFalse(tileIsFocused(focus: "pinned_left", focusedColumn: 0, pin: nil, column: 0))
+        XCTAssertTrue(tileIsFocused(focus: "column", focusedColumn: 2, pin: nil, column: 2))
+        XCTAssertFalse(tileIsFocused(focus: "none", focusedColumn: 0, pin: nil, column: 0))
+        XCTAssertTrue(tileIsFocused(focus: nil, focusedColumn: 1, pin: nil, column: 1))
+    }
+
+    func testBorderColorParsesHex() {
+        let color = color(hex: "#4C8DFF")
+        var red: CGFloat = 0
+        var green: CGFloat = 0
+        var blue: CGFloat = 0
+        var alpha: CGFloat = 0
+        color.usingColorSpace(.sRGB)?.getRed(&red, green: &green, blue: &blue, alpha: &alpha)
+        XCTAssertEqual(red, 76.0 / 255.0, accuracy: 0.01)
+        XCTAssertEqual(green, 141.0 / 255.0, accuracy: 0.01)
+        XCTAssertEqual(blue, 1, accuracy: 0.01)
+    }
+
     func testConflictDetectionFlagsDuplicates() {
         var bindings = ShortcutCodec.defaults
         bindings["focus_right"] = ["ctrl+alt-h"]
@@ -41,11 +61,11 @@ final class SettingsTests: XCTestCase {
 
     func testIndicatorSnapshotShowsFiveTilesWithFocusAndPins() {
         let tiles = [
-            IndicatorTile(title: "Pinned", count: 1, focused: false, pin: .left, windowID: 1, columnIndex: 0),
-            IndicatorTile(title: "Focus", count: 2, focused: true, pin: nil, windowID: 2, columnIndex: 1),
-            IndicatorTile(title: "Third", count: 1, focused: false, pin: nil, windowID: 3, columnIndex: 2),
-            IndicatorTile(title: "Fourth", count: 3, focused: false, pin: nil, windowID: 4, columnIndex: 3),
-            IndicatorTile(title: "End", count: 1, focused: false, pin: .right, windowID: 5, columnIndex: 4),
+            IndicatorTile(title: "Pinned", bundleID: "", pid: 0, count: 1, focused: false, pin: .left, windowID: 1, columnIndex: 0),
+            IndicatorTile(title: "Focus", bundleID: "", pid: 0, count: 2, focused: true, pin: nil, windowID: 2, columnIndex: 1),
+            IndicatorTile(title: "Third", bundleID: "", pid: 0, count: 1, focused: false, pin: nil, windowID: 3, columnIndex: 2),
+            IndicatorTile(title: "Fourth", bundleID: "", pid: 0, count: 3, focused: false, pin: nil, windowID: 4, columnIndex: 3),
+            IndicatorTile(title: "End", bundleID: "", pid: 0, count: 1, focused: false, pin: .right, windowID: 5, columnIndex: 4),
         ]
         XCTAssertEqual(tiles.count, 5)
         XCTAssertEqual(IndicatorArt.frames(count: tiles.count).count, 5)

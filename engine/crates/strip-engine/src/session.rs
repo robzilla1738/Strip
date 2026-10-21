@@ -1,12 +1,13 @@
 //! One strip per display and Space. Publishes frames through the writer pool.
 
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use strip_core::{
-    layout, CenterMode, Corner, DisplayFrame, DisplayMode, Focus, Frame, Gesture, LayoutParams, Spring, Strip, SwipeView, Viewport, Visibility, Window, WindowId,
+    column_width, layout, CenterMode, Corner, DisplayFrame, DisplayMode, Focus, Frame, Gesture, LayoutParams, Spring, Strip, SwipeView, Viewport, Visibility, Window, WindowId,
 };
 
 use crate::ax::{self, AxApi, DisplayInfo, ListedWindow, Traits};
@@ -15,6 +16,7 @@ use crate::display_link::DisplayDriver;
 use crate::parking::{relocated_repair, repair_relocated, restored_frame};
 use crate::private_api::PrivateApi;
 use crate::restore::{self, SavedSession};
+use crate::window_api::WindowApi;
 use crate::writer::{Clock, SystemClock, WriterPool};
 
 /// Active strip identity. SkyLight uses the live Space id. Without it the id
@@ -31,6 +33,8 @@ pub struct Runtime {
     strips: HashMap<StripKey, Strip>,
     meta: HashMap<u64, Meta>,
     last_on_screen: HashMap<u64, Frame>,
+    /// Windows whose latest layout is on screen. Parked and inactive tabs are absent.
+    shown: HashSet<u64>,
     state: Arc<Mutex<String>>,
     metrics_body: Arc<Mutex<String>>,
     only_owner: Option<String>,
@@ -39,6 +43,8 @@ pub struct Runtime {
     screens: Vec<DisplayInfo>,
     config_path: Option<PathBuf>,
     motions: HashMap<u64, Motion>,
+    /// Rendered scroll per strip. `Strip::scroll_x` is where it is heading.
+    views: HashMap<StripKey, Spring>,
     driver: DisplayDriver,
     animating: bool,
     gesture: Gesture,
@@ -65,7 +71,28 @@ pub struct Runtime {
     pointer_at: Instant,
     pointer_seen: bool,
     drag: Option<Drag>,
+    /// Bumps when the published state text changes.
+    state_version: Cell<u64>,
+    emitted_version: Cell<u64>,
+    /// True while a swipe moves the strip: windows follow the fingers without a spring.
+    tracking: bool,
+    swipe_at: Option<Instant>,
+    /// True after a swipe went quiet and was ended here; the next finger movement resumes it.
+    swipe_expired: bool,
+    swipe_state_at: Option<Instant>,
+    /// Consecutive ticks a window showed a size other than its target, and that size.
+    size_misses: HashMap<u64, (u8, (f64, f64))>,
+    /// Windows whose AX element could not be resolved, and when to try again.
+    resolve_after: RefCell<HashMap<u64, Instant>>,
 }
+
+/// An unresolvable window (no AX element) is retried at most this often.
+const RESOLVE_RETRY: Duration = Duration::from_secs(2);
+/// A swipe with no gesture event for this long is ended. macOS stops sending
+/// events when it takes a gesture over, for example to switch Spaces.
+const SWIPE_IDLE: Duration = Duration::from_millis(300);
+/// Caps the release velocity handed to the snap spring, in points per second.
+const MAX_FLING: f64 = 9000.0;
 
 struct Motion {
     x: Spring,
@@ -75,6 +102,21 @@ struct Motion {
     pid: i32,
     bundle_id: String,
     pending_shrink: Option<(f64, f64)>,
+    /// The strip or pin the motion's coordinates are relative to.
+    anchor: Option<Anchor>,
+    offset: f64,
+    /// The parked frame while the window is off screen.
+    park: Option<Frame>,
+    /// Last screen position sent to the writer.
+    written: Option<(f64, f64)>,
+    /// A deferred smaller size that is due now the move has ended.
+    size_due: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct Anchor {
+    strip: StripKey,
+    pinned: bool,
 }
 
 impl Motion {
@@ -87,20 +129,16 @@ impl Motion {
             pid,
             bundle_id: bundle.to_string(),
             pending_shrink: None,
+            anchor: None,
+            offset: 0.0,
+            park: None,
+            written: None,
+            size_due: false,
         }
     }
 
     fn settled(&self) -> bool {
         (self.x.x - self.x.target).abs() < 0.5 && self.x.v.abs() < 5.0 && (self.y.x - self.y.target).abs() < 0.5 && self.y.v.abs() < 5.0
-    }
-
-    fn rendered(&self) -> Frame {
-        Frame {
-            x: self.x.x,
-            y: self.y.x,
-            width: self.width,
-            height: self.height,
-        }
     }
 
     fn snap(&mut self, frame: Frame) {
@@ -140,6 +178,21 @@ struct Drag {
     id: u64,
     display: String,
     column: usize,
+    x: f64,
+    y: f64,
+    /// Pressed on the title bar, so a move is a reorder.
+    title_bar: bool,
+}
+
+/// Mouse travel below this between title-bar press and release is a click, not a drag.
+const DRAG_SLOP: f64 = 6.0;
+/// Resize handles sit a few points outside the window frame.
+const GRAB_MARGIN: f64 = 6.0;
+const SWIPE_STATE_EVERY: Duration = Duration::from_millis(33);
+
+pub struct SwipeNotice {
+    pub started: bool,
+    pub updated: bool,
 }
 
 impl Runtime {
@@ -174,6 +227,7 @@ impl Runtime {
             strips: HashMap::new(),
             meta: HashMap::new(),
             last_on_screen: HashMap::new(),
+            shown: HashSet::new(),
             state,
             metrics_body,
             only_owner,
@@ -182,6 +236,7 @@ impl Runtime {
             screens: Vec::new(),
             config_path,
             motions: HashMap::new(),
+            views: HashMap::new(),
             driver: DisplayDriver::new(),
             animating: false,
             gesture: Gesture::new(),
@@ -206,6 +261,14 @@ impl Runtime {
             pointer_at: now,
             pointer_seen: false,
             drag: None,
+            state_version: Cell::new(0),
+            emitted_version: Cell::new(0),
+            tracking: false,
+            swipe_at: None,
+            swipe_expired: false,
+            swipe_state_at: None,
+            size_misses: HashMap::new(),
+            resolve_after: RefCell::new(HashMap::new()),
         }
     }
 
@@ -227,21 +290,26 @@ impl Runtime {
         runtime
     }
 
-    /// Returns true on the frame a horizontal swipe first arms, once per gesture.
-    pub fn drive_swipe(&mut self, fingers: u8, dx: f64, dy: f64, phase: &str) -> bool {
+    /// `started` is the frame a horizontal swipe first arms. `updated` means `scroll_x` changed.
+    pub fn drive_swipe(&mut self, fingers: u8, dx: f64, dy: f64, phase: &str) -> SwipeNotice {
         let before = self.gesture.is_armed();
-        let _ = self.apply_swipe(fingers, dx, dy, phase);
-        !before && self.gesture.is_armed()
+        let updated = self.apply_swipe(fingers, dx, dy, phase).unwrap_or(false);
+        SwipeNotice {
+            started: !before && self.gesture.is_armed(),
+            updated,
+        }
     }
 
-    fn apply_swipe(&mut self, fingers: u8, dx: f64, dy: f64, phase: &str) -> Result<(), CommandError> {
-        let display = self.active_display().ok_or(CommandError::NoFocusedWindow)?;
+    fn apply_swipe(&mut self, fingers: u8, dx: f64, dy: f64, phase: &str) -> Result<bool, CommandError> {
+        let display = self.swipe_display().ok_or(CommandError::NoFocusedWindow)?;
         let visible = self.viewport_of(&display);
         let ratios: Vec<f64> = self
             .strip(&display)
-            .map(|strip| strip.columns.iter().map(|column| column.width_ratio).collect())
+            .map(|strip| strip.columns.iter().map(|column| column_width(column, visible.width) / visible.width.max(1.0)).collect())
             .unwrap_or_default();
         let scroll = self.strip(&display).map(|strip| strip.scroll_x).unwrap_or(0.0);
+        let params = layout_params(&self.config);
+        let view_width = self.strip(&display).map_or(visible.width, |strip| strip_core::scroll_width(strip, &params, visible));
         let view = SwipeView::from_ratios(
             &ratios,
             visible.width,
@@ -250,18 +318,45 @@ impl Runtime {
             self.config.swipe.swipe_natural,
             self.config.swipe.swipe_deceleration,
         );
+        let content = view.spans.last().map_or(0.0, |(prefix, width)| prefix + width);
+        let center = match params.center {
+            CenterMode::Always => true,
+            CenterMode::OnOverflow => content > view_width + 1e-6,
+            CenterMode::Never => false,
+        };
+        let view = view.with_view(view_width, center);
+        let now = Instant::now();
         let update = match phase {
             "began" => {
+                self.swipe_expired = false;
                 self.gesture.begin(fingers, self.config.swipe.swipe_fingers, scroll);
+                self.swipe_at = Some(now);
                 strip_core::SwipeUpdate::default()
             }
-            "moved" => self.gesture.moved(dx, dy, &view, 1.0 / 60.0),
-            "ended" => self.gesture.ended(&view),
+            "moved" => {
+                if self.swipe_expired && !self.gesture.is_open() {
+                    self.gesture.begin(fingers, self.config.swipe.swipe_fingers, scroll);
+                    self.swipe_at = Some(now);
+                }
+                // Velocity uses the real event spacing; trackpads report at 90–120 Hz.
+                let dt = self.swipe_at.map(|then| now.duration_since(then).as_secs_f64()).unwrap_or(1.0 / 60.0).clamp(1.0 / 240.0, 1.0 / 20.0);
+                self.swipe_at = Some(now);
+                self.gesture.moved(dx, dy, &view, dt)
+            }
+            "ended" => {
+                // Fingers that rested before lifting carry no momentum.
+                if self.swipe_at.is_some_and(|then| now.duration_since(then) > Duration::from_millis(80)) {
+                    self.gesture.rest();
+                }
+                self.swipe_at = None;
+                self.gesture.ended(&view)
+            }
             _ => return Err(CommandError::BadRequest("phase must be began, moved, or ended".to_string())),
         };
         let Some(scroll) = update.scroll else {
-            return Ok(());
+            return Ok(false);
         };
+        let release = phase == "ended";
         if let Some(strip) = self.strip_mut(&display) {
             strip.scroll_x = scroll;
             if let Some(index) = update.focus {
@@ -271,21 +366,94 @@ impl Runtime {
             }
         }
         let screens = self.screens.clone();
-        let params = layout_params(&self.config);
+        self.tracking = !release;
+        if release {
+            self.hand_off_fling(&display, self.gesture.velocity());
+        }
         self.publish_layouts(&screens, &params);
-        self.publish_state(&screens);
-        Ok(())
+        self.tracking = false;
+        if release {
+            if let Ok(snap) = self.focus_snap(&display) {
+                self.raise_window(snap.window_id);
+            }
+        }
+        // Trackpads report at up to 120 Hz; the overlays only need the state at
+        // a modest rate while the fingers move, and always on release.
+        if release || self.swipe_state_at.is_none_or(|then| now.duration_since(then) >= SWIPE_STATE_EVERY) {
+            self.swipe_state_at = Some(now);
+            self.publish_state(&screens);
+        }
+        Ok(true)
+    }
+
+    /// Seeds the strip's scroll spring with the finger velocity so the strip
+    /// keeps its momentum after lift instead of stopping and easing out.
+    fn hand_off_fling(&mut self, display: &str, scroll_velocity: f64) {
+        let velocity = scroll_velocity.clamp(-MAX_FLING, MAX_FLING);
+        if !velocity.is_finite() || velocity.abs() < 1.0 {
+            return;
+        }
+        let key = self.key_of(display);
+        if let Some(view) = self.views.get_mut(&key) {
+            view.v = velocity;
+        }
+    }
+
+    /// Accessibility granted after launch: commands start working without a restart.
+    pub fn set_trusted(&mut self, trusted: bool) {
+        self.ax_trusted = trusted;
+    }
+
+    pub fn swipe_armed(&self) -> bool {
+        self.gesture.is_armed() && self.gesture.is_open()
+    }
+
+    /// When an open swipe should be ended for lack of events.
+    pub fn swipe_deadline(&self) -> Option<Instant> {
+        self.swipe_at.filter(|_| self.gesture.is_open()).map(|then| then + SWIPE_IDLE)
+    }
+
+    pub fn expire_swipe(&mut self) {
+        if self.swipe_deadline().is_some_and(|due| Instant::now() >= due) {
+            let _ = self.apply_swipe(0, 0.0, 0.0, "ended");
+            self.swipe_expired = true;
+        }
     }
 
     pub fn is_animating(&self) -> bool {
         self.animating
     }
 
-    pub fn drain_frames(&mut self) {
+    /// Step due display-link frames. Returns true when a frame was published.
+    pub fn drain_frames(&mut self) -> bool {
         let dts = self.driver.take_dts();
+        if dts.is_empty() {
+            return false;
+        }
         for dt in dts {
             self.step_animation(dt);
         }
+        self.publish_state(&self.screens);
+        true
+    }
+
+    /// The published state text when it changed since the last call.
+    pub fn take_state_change(&self) -> Option<String> {
+        let version = self.state_version.get();
+        if version == self.emitted_version.get() {
+            return None;
+        }
+        self.emitted_version.set(version);
+        Some(self.state.lock().unwrap_or_else(|err| err.into_inner()).clone())
+    }
+
+    pub fn state_version(&self) -> u64 {
+        self.state_version.get()
+    }
+
+    pub fn snapshot(&self) -> serde_json::Value {
+        let text = self.state.lock().unwrap_or_else(|err| err.into_inner()).clone();
+        serde_json::from_str(&text).unwrap_or_else(|_| serde_json::json!({}))
     }
 
     pub fn tick(&mut self) {
@@ -304,11 +472,9 @@ impl Runtime {
             window.space = crate::private_api::assign_strip_space(self.skylight, active, None, true);
         }
         listed.sort_by_key(|window| window.id);
-        let need_resolve = self.force_resolve || listed.iter().any(|window| !self.meta.contains_key(&window.id) && !self.floating.contains_key(&window.id));
-        if need_resolve || self.saved.is_some() {
-            self.pool.with_api(|api| ax::resolve_elements(api, &listed));
-        }
+        self.resolve_listed(&listed);
         let mut seen: HashSet<u64> = listed.iter().map(|window| window.id).collect();
+        self.resolve_after.borrow_mut().retain(|id, _| seen.contains(id));
         self.floating.retain(|id, _| seen.contains(id));
         let restoring = self.saved.as_ref().is_some_and(|saved| !saved.windows.is_empty()) && Instant::now() <= self.restore_until;
         if restoring {
@@ -339,7 +505,7 @@ impl Runtime {
                 index: item.index,
                 display: item.display.clone(),
             }) {
-                let traits = self.pool.with_api(|api| api.describe(window.id));
+                let traits = self.pool.with_api_ref(|api| api.describe(window.id));
                 if traits.fullscreen {
                     continue;
                 }
@@ -347,7 +513,7 @@ impl Runtime {
                 self.reinsert(window, saved, front, &params);
                 continue;
             }
-            let traits = self.pool.with_api(|api| api.describe(window.id));
+            let traits = self.pool.with_api_ref(|api| api.describe(window.id));
             if traits.role.is_empty() && traits.subrole.is_empty() {
                 continue;
             }
@@ -362,12 +528,44 @@ impl Runtime {
         self.transfer_moved(&listed, &params);
         self.transfer_moved(&off_space, &params);
         self.remove_missing(&seen, &params);
+        self.check_sizes(&listed);
         self.focus_follows_pointer();
         self.publish_layouts(&displays, &params);
         self.settle = false;
         self.pool.poll_enhanced_ui();
         self.publish_state(&self.screens);
         self.store_metrics();
+    }
+
+    /// Copies `AXWindows` only for apps with a window whose element is unknown.
+    /// Windows that never resolve are retried every `RESOLVE_RETRY`, so they do
+    /// not force an AX walk of every app on every tick.
+    fn resolve_listed(&self, listed: &[ListedWindow]) {
+        let now = Instant::now();
+        let force = self.force_resolve;
+        let pending: Vec<ListedWindow> = self.pool.with_api_ref(|api| {
+            let retry = self.resolve_after.borrow();
+            listed
+                .iter()
+                .filter(|window| !self.floating.contains_key(&window.id) && !api.knows(window.id))
+                .filter(|window| force || retry.get(&window.id).is_none_or(|due| now >= *due))
+                .cloned()
+                .collect()
+        });
+        if pending.is_empty() {
+            return;
+        }
+        let missing: Vec<u64> = self.pool.with_api(|api| {
+            ax::resolve_elements(api, &pending);
+            pending.iter().filter(|window| !api.knows(window.id)).map(|window| window.id).collect()
+        });
+        let mut retry = self.resolve_after.borrow_mut();
+        for window in &pending {
+            retry.remove(&window.id);
+        }
+        for id in missing {
+            retry.insert(id, now + RESOLVE_RETRY);
+        }
     }
 
     /// Space change. Does not sleep. The fallback hash runs only on this path.
@@ -385,9 +583,9 @@ impl Runtime {
         self.force_resolve = false;
     }
 
-    /// Wait, re-enable the event tap, and re-apply the current strips without animation.
+    /// Re-enable the event taps and re-apply the current strips without animation.
+    /// The caller waits the 1.5 s settle time without blocking this thread.
     pub fn resync_after_wake(&mut self) {
-        std::thread::sleep(Duration::from_millis(1500));
         let _ = crate::hotkeys::enable_tap();
         self.apply_wake_space();
         self.settle = true;
@@ -447,6 +645,7 @@ impl Runtime {
         }
         #[cfg(feature = "debug-hooks")]
         if action == "simulate_wake" {
+            std::thread::sleep(Duration::from_millis(1500));
             self.resync_after_wake();
             return Ok(None);
         }
@@ -583,18 +782,43 @@ impl Runtime {
             self.meta.remove(&id);
             self.last_on_screen.remove(&id);
             self.motions.remove(&id);
+            self.size_misses.remove(&id);
             self.park_repaired.remove(&id);
+            self.shown.remove(&id);
+            self.pool.with_api(|api| api.forget(id));
         }
     }
 
     fn publish_layouts(&mut self, displays: &[DisplayInfo], params: &LayoutParams) {
         self.apply_size_overrides();
+        let duration = f64::from(self.config.animation.animation_duration_ms) / 1000.0;
+        let glide = !self.tracking && !self.settle && duration > 0.0;
         let mut flying = false;
         let mut active_displays = Vec::new();
         for display in displays {
-            let Some(strip) = self.strip(&display.uuid) else {
+            let key = self.key_of(&display.uuid);
+            let Some(mut shown) = self.strips.get(&key).cloned() else {
                 continue;
             };
+            // The strip scrolls as one body: one spring per strip carries every
+            // column, so columns slide in and out together instead of jumping
+            // to or from their parks.
+            let target = shown.scroll_x;
+            let view = self.views.entry(key.clone()).or_insert_with(|| Spring::launch(target, target));
+            if glide {
+                view.retarget(target);
+            }
+            let view_moving = glide && ((view.x - target).abs() >= 0.5 || view.v.abs() >= 5.0);
+            if !view_moving {
+                *view = Spring::launch(target, target);
+            }
+            let scroll = view.x;
+            shown.scroll_x = scroll;
+            let pinned: HashSet<u64> = [shown.pinned_left.as_ref(), shown.pinned_right.as_ref()]
+                .into_iter()
+                .flatten()
+                .flat_map(|pin| pin.column.windows.iter().map(|window| window.id.0))
+                .collect();
             let visible = viewport(&display.visible);
             let screen = DisplayFrame {
                 min_x: display.frame.x,
@@ -604,18 +828,10 @@ impl Runtime {
                 neighbour_left: display.neighbour_left || self.extra_left.contains(&display.uuid),
                 neighbour_right: display.neighbour_right || self.extra_right.contains(&display.uuid),
             };
-            let placements = layout(strip, visible, screen, params);
-            let mut display_flying = false;
+            let placements = layout(&shown, visible, screen, params);
+            let mut display_flying = view_moving;
             for placement in placements {
                 let id = placement.window.0;
-                if matches!(placement.visibility, Visibility::Visible | Visibility::Partial) {
-                    self.last_on_screen.insert(id, placement.frame);
-                }
-                let Some(meta) = self.meta.get(&id) else {
-                    continue;
-                };
-                let pid = meta.pid;
-                let bundle = meta.bundle_id.clone();
                 let hidden = matches!(placement.visibility, Visibility::Hidden);
                 let mut frame = placement.frame;
                 if hidden {
@@ -625,25 +841,42 @@ impl Runtime {
                 } else {
                     self.park_repaired.remove(&id);
                 }
-                let animate = !hidden;
-                if self.follow(pid, id, &bundle, frame, animate) {
-                    display_flying = true;
+                let Some(meta) = self.meta.get(&id) else {
+                    if hidden {
+                        self.shown.remove(&id);
+                    }
+                    continue;
+                };
+                let pid = meta.pid;
+                let bundle = meta.bundle_id.clone();
+                let anchor = Anchor { strip: key.clone(), pinned: pinned.contains(&id) };
+                let offset = if anchor.pinned { 0.0 } else { scroll };
+                let (window_flying, published) = self.follow(pid, id, &bundle, frame, !hidden, anchor, offset);
+                if hidden {
+                    self.shown.remove(&id);
+                } else {
+                    self.shown.insert(id);
+                    self.last_on_screen.insert(id, published);
                 }
+                display_flying |= window_flying;
             }
             if display_flying {
                 flying = true;
                 active_displays.push(display.cg_id);
             }
         }
+        self.animating = flying;
         if flying {
-            self.animating = true;
             for display in active_displays {
                 self.driver.start(display);
             }
+        } else {
+            self.driver.stop();
         }
-        self.store_metrics();
+        if !self.tracking {
+            self.store_metrics();
+        }
     }
-
     fn publish_state(&self, displays: &[DisplayInfo]) {
         let body = serde_json::json!({
             "managing": self.managing,
@@ -656,7 +889,11 @@ impl Runtime {
             })).collect::<Vec<_>>(),
         });
         if let Ok(text) = serde_json::to_string(&body) {
-            *self.state.lock().unwrap_or_else(|err| err.into_inner()) = text;
+            let mut state = self.state.lock().unwrap_or_else(|err| err.into_inner());
+            if *state != text {
+                *state = text;
+                self.state_version.set(self.state_version.get().wrapping_add(1));
+            }
         }
     }
 
@@ -699,6 +936,8 @@ impl Runtime {
             "space": space,
             "scroll_x": strip.map(|strip| strip.scroll_x).unwrap_or(0.0),
             "focused_column": focused,
+            "focus": strip.map(|strip| focus_name(strip.focus)).unwrap_or("none"),
+            "focused_window": strip.and_then(focused_window_id).map_or(serde_json::Value::Null, serde_json::Value::from),
             "pinned_left": strip.map(|strip| pin_json(self, strip.pinned_left.as_ref())).unwrap_or(serde_json::Value::Null),
             "pinned_right": strip.map(|strip| pin_json(self, strip.pinned_right.as_ref())).unwrap_or(serde_json::Value::Null),
             "columns": columns,
@@ -751,7 +990,7 @@ impl Runtime {
             "title": meta.map(|meta| meta.title.clone()).unwrap_or_default(),
             "frame": frame_json(frame),
             "target": frame_json(frame),
-            "visible": true,
+            "visible": self.shown.contains(&window.id.0),
             "height_ratio": window.height_ratio,
             "role": meta.map(|meta| meta.role.clone()).unwrap_or_default(),
             "subrole": meta.map(|meta| meta.subrole.clone()).unwrap_or_default(),
@@ -806,88 +1045,103 @@ impl CommandError {
     }
 }
 
-enum Follow {
-    Idle,
-    Flying,
-    Write(Frame),
-    Launch { sized: Option<Frame>, current: Frame },
-}
-
 impl Runtime {
-    fn follow(&mut self, pid: i32, id: u64, bundle: &str, target: Frame, animate: bool) -> bool {
-        if !self.motions.contains_key(&id) {
-            self.pool.publish(pid, id, target, bundle);
-            self.motions.insert(id, Motion::rest(pid, bundle, target));
-            return false;
-        }
+    /// `target` is the screen frame for this layout. Motions run in strip
+    /// coordinates (`screen x + offset`), so scrolling moves no spring but the
+    /// strip's own, and a window keeps its place relative to its neighbours.
+    #[allow(clippy::too_many_arguments)]
+    fn follow(&mut self, pid: i32, id: u64, bundle: &str, target: Frame, animate: bool, anchor: Anchor, offset: f64) -> (bool, Frame) {
+        let on_strip = Frame { x: target.x + offset, ..target };
         let duration = f64::from(self.config.animation.animation_duration_ms) / 1000.0;
-        let action = {
-            let motion = self.motions.get_mut(&id).expect("motion");
-            motion.pid = pid;
-            motion.bundle_id = bundle.to_string();
-            if self.settle {
-                motion.snap(target);
-                Follow::Write(target)
-            } else {
-            let size_delta = (motion.width - target.width).abs().max((motion.height - target.height).abs());
-            let pos_delta = (motion.x.target - target.x).abs().max((motion.y.target - target.y).abs());
-            if !animate || duration <= 0.0 {
-                if size_delta > 0.5 || pos_delta > 0.5 || !motion.settled() {
-                    motion.snap(target);
-                    Follow::Write(target)
-                } else {
-                    Follow::Idle
-                }
-            } else if pos_delta <= 0.5 && size_delta <= 0.5 {
-                if motion.settled() { Follow::Idle } else { Follow::Flying }
-            } else if pos_delta <= 0.5 && motion.settled() {
-                motion.snap(target);
-                Follow::Write(target)
-            } else {
-                let grew = target.width * target.height > motion.width * motion.height + 1.0;
-                let shrank = target.width * target.height + 1.0 < motion.width * motion.height;
-                let sized = if size_delta > 0.5 && grew {
-                    let frame = Frame {
-                        x: motion.x.x,
-                        y: motion.y.x,
-                        width: target.width,
-                        height: target.height,
-                    };
-                    motion.width = target.width;
-                    motion.height = target.height;
-                    Some(frame)
-                } else {
-                    None
-                };
-                if shrank {
-                    motion.pending_shrink = Some((target.width, target.height));
-                } else if size_delta > 0.5 && !grew {
-                    motion.width = target.width;
-                    motion.height = target.height;
-                }
-                if pos_delta > 0.5 {
-                    motion.x.retarget(target.x);
-                    motion.y.retarget(target.y);
-                }
-                Follow::Launch { sized, current: motion.rendered() }
+        let Some(motion) = self.motions.get_mut(&id) else {
+            self.pool.publish(pid, id, target, bundle);
+            let mut motion = Motion::rest(pid, bundle, on_strip);
+            motion.anchor = Some(anchor);
+            motion.offset = offset;
+            motion.written = Some((target.x, target.y));
+            if !animate {
+                motion.park = Some(target);
             }
-            }
+            self.motions.insert(id, motion);
+            return (false, target);
         };
-        match action {
-            Follow::Idle => false,
-            Follow::Flying => true,
-            Follow::Write(frame) => {
-                self.pool.publish(pid, id, frame, bundle);
-                false
+        motion.pid = pid;
+        if motion.bundle_id != bundle {
+            motion.bundle_id = bundle.to_string();
+        }
+        if motion.anchor.as_ref() != Some(&anchor) {
+            // A new strip or pin has its own offset; shift so the window does not jump on screen.
+            let shift = offset - motion.offset;
+            motion.x.x += shift;
+            motion.x.target += shift;
+            motion.anchor = Some(anchor);
+        }
+        motion.offset = offset;
+        let differs = |a: (f64, f64), b: Frame| (a.0 - b.x).abs() > 0.1 || (a.1 - b.y).abs() > 0.1;
+        if !animate {
+            let moved = motion.park.is_none_or(|park| differs((park.x, park.y), target) || (park.width - target.width).abs() > 0.5 || (park.height - target.height).abs() > 0.5);
+            motion.snap(on_strip);
+            motion.size_due = false;
+            motion.park = Some(target);
+            motion.written = Some((target.x, target.y));
+            if moved || self.settle {
+                self.pool.publish(pid, id, target, bundle);
             }
-            Follow::Launch { sized, current } => {
-                if let Some(frame) = sized {
-                    self.pool.publish(pid, id, frame, bundle);
-                }
-                self.pool.publish_position(pid, id, current, bundle);
-                true
+            return (false, target);
+        }
+        let resized = (motion.width - target.width).abs() > 0.5 || (motion.height - target.height).abs() > 0.5;
+        // Leaving a park, the window starts at its own place on the strip and the
+        // strip's spring carries it in with the rest.
+        let unparked = motion.park.take().is_some();
+        if unparked || self.tracking || self.settle || duration <= 0.0 {
+            motion.snap(on_strip);
+            motion.size_due = false;
+            let moved = motion.written.is_none_or(|written| differs(written, target));
+            motion.written = Some((target.x, target.y));
+            if resized || self.settle {
+                self.pool.publish(pid, id, target, bundle);
+            } else if moved {
+                self.pool.publish_position(pid, id, target, bundle);
+            }
+            return (false, target);
+        }
+        let size_delta = (motion.width - target.width).abs().max((motion.height - target.height).abs());
+        let pos_delta = (motion.x.target - on_strip.x).abs().max((motion.y.target - on_strip.y).abs());
+        if pos_delta <= 0.5 && size_delta > 0.5 && motion.settled() {
+            motion.snap(on_strip);
+            motion.size_due = false;
+            motion.written = Some((target.x, target.y));
+            self.pool.publish(pid, id, target, bundle);
+            return (false, target);
+        }
+        let mut sized = std::mem::take(&mut motion.size_due);
+        if size_delta > 0.5 {
+            let shrank = target.width * target.height + 1.0 < motion.width * motion.height;
+            if shrank {
+                // A smaller size lands once the move ends, so the window never
+                // shows a gap while it travels.
+                motion.pending_shrink = Some((target.width, target.height));
+            } else {
+                motion.width = target.width;
+                motion.height = target.height;
+                motion.pending_shrink = None;
+                sized = true;
             }
         }
+        if pos_delta > 0.5 {
+            motion.x.retarget(on_strip.x);
+            motion.y.retarget(on_strip.y);
+        }
+        let current = Frame { x: motion.x.x - offset, y: motion.y.x, width: motion.width, height: motion.height };
+        let moved = motion.written.is_none_or(|written| differs(written, current));
+        motion.written = Some((current.x, current.y));
+        let flying = !motion.settled();
+        if sized {
+            self.pool.publish(pid, id, current, bundle);
+        } else if moved {
+            self.pool.publish_position(pid, id, current, bundle);
+        }
+        (flying, current)
     }
 
     fn step_animation(&mut self, dt: f64) {
@@ -896,47 +1150,36 @@ impl Runtime {
         }
         let zeta = self.config.animation.animation_damping;
         let omega = Spring::omega(f64::from(self.config.animation.animation_duration_ms) / 1000.0);
-        let ids: Vec<u64> = self.motions.keys().copied().collect();
-        let mut still = false;
-        let mut shrinks = Vec::new();
-        for id in ids {
-            let step = {
-                let Some(motion) = self.motions.get_mut(&id) else {
-                    continue;
-                };
-                if motion.settled() {
-                    continue;
-                }
-                let x_done = motion.x.step(dt, zeta, omega);
-                let y_done = motion.y.step(dt, zeta, omega);
-                let done = x_done && y_done;
-                let frame = motion.rendered();
-                let shrink = if done { motion.pending_shrink.take() } else { None };
-                if let Some((width, height)) = shrink {
+        for view in self.views.values_mut() {
+            if (view.x - view.target).abs() < 0.5 && view.v.abs() < 5.0 {
+                continue;
+            }
+            if view.step(dt, zeta, omega) {
+                *view = Spring::launch(view.target, view.target);
+            }
+        }
+        for motion in self.motions.values_mut() {
+            if motion.park.is_some() || motion.settled() {
+                continue;
+            }
+            let x_done = motion.x.step(dt, zeta, omega);
+            let y_done = motion.y.step(dt, zeta, omega);
+            if x_done && y_done {
+                motion.x = Spring::launch(motion.x.target, motion.x.target);
+                motion.y = Spring::launch(motion.y.target, motion.y.target);
+                if let Some((width, height)) = motion.pending_shrink.take() {
                     motion.width = width;
                     motion.height = height;
+                    motion.size_due = true;
                 }
-                (motion.pid, motion.bundle_id.clone(), frame, done, shrink)
-            };
-            let (pid, bundle, frame, done, shrink) = step;
-            self.pool.publish_position(pid, id, frame, &bundle);
-            if let Some((width, height)) = shrink {
-                shrinks.push((pid, id, bundle, Frame { x: frame.x, y: frame.y, width, height }));
-            }
-            if !done {
-                still = true;
             }
         }
-        if !still {
-            self.animating = false;
-            self.driver.stop();
-            for (pid, id, bundle, frame) in shrinks {
-                self.pool.publish(pid, id, frame, &bundle);
-            }
-        }
-        self.store_metrics();
+        // Each frame lays the strip out again at the moving scroll, so columns
+        // that slide fully off screen are parked and ones that slide on are placed.
+        let screens = self.screens.clone();
+        let params = layout_params(&self.config);
+        self.publish_layouts(&screens, &params);
     }
-
     fn store_metrics(&self) {
         let mut metrics = self.pool.metrics();
         let mut ax_write_ms = serde_json::Map::new();
@@ -1000,6 +1243,12 @@ impl Runtime {
         occupied.or_else(|| self.screens.first().map(|screen| screen.uuid.clone()))
     }
 
+    /// A swipe scrolls the strip on the display under the pointer.
+    fn swipe_display(&self) -> Option<String> {
+        let under = self.screen_at(self.pointer_x, self.pointer_y).filter(|uuid| self.strip(uuid).is_some_and(|strip| !strip.columns.is_empty()));
+        under.or_else(|| self.active_display())
+    }
+
     fn viewport_of(&self, uuid: &str) -> Viewport {
         viewport_for_display(&self.screens, uuid)
     }
@@ -1035,7 +1284,7 @@ impl Runtime {
         let Some(pid) = self.meta.get(&id).map(|meta| meta.pid) else {
             return;
         };
-        self.pool.with_api(|api| {
+        self.pool.with_api_ref(|api| {
             let mut host = crate::focus::AxHost { api };
             crate::focus::raise_focused(&mut host, id, pid);
         });
@@ -1045,7 +1294,18 @@ impl Runtime {
         let active = self.active_space();
         let mut fallback = None;
         for (key, strip) in &self.strips {
-            if let Some(index) = strip.columns.iter().position(|column| column.windows.iter().any(|window| window.id.0 == id)) {
+            let pinned = strip
+                .pinned_left
+                .as_ref()
+                .into_iter()
+                .chain(strip.pinned_right.as_ref())
+                .any(|pin| pin.column.windows.iter().any(|window| window.id.0 == id));
+            let index = strip
+                .columns
+                .iter()
+                .position(|column| column.windows.iter().any(|window| window.id.0 == id))
+                .or_else(|| pinned.then_some(0));
+            if let Some(index) = index {
                 let found = (key.display.clone(), index);
                 if key.space == active {
                     return Some(found);
@@ -1098,15 +1358,15 @@ impl Runtime {
         self.pointer_y = y;
         self.pointer_at = Instant::now();
         self.pointer_seen = true;
-        if !self.config.focus.drag_to_reorder {
-            return;
-        }
         if kind == 1 {
-            if let Some((id, display, column, frame)) = self.window_under(x, y) {
-                if y <= frame.y + 28.0 {
-                    self.drag = Some(Drag { id, display, column });
-                }
-            }
+            self.drag = self.window_under(x, y, GRAB_MARGIN).map(|(id, display, column, frame)| Drag {
+                id,
+                display,
+                column,
+                x,
+                y,
+                title_bar: x >= frame.x && x < frame.right() && y >= frame.y && y <= frame.y + 28.0,
+            });
             return;
         }
         if kind != 2 {
@@ -1115,6 +1375,15 @@ impl Runtime {
         let Some(drag) = self.drag.take() else {
             return;
         };
+        if (x - drag.x).hypot(y - drag.y) < DRAG_SLOP {
+            return;
+        }
+        if self.adopt_hand_resize(&drag) || !drag.title_bar || !self.config.focus.drag_to_reorder {
+            return;
+        }
+        // The user moved the window by hand, so its motion no longer matches the
+        // screen. A fresh motion writes the full slot frame on the next layout.
+        self.motions.remove(&drag.id);
         let params = layout_params(&self.config);
         let Some(target) = self.screen_at(x, y) else {
             return;
@@ -1124,18 +1393,60 @@ impl Runtime {
             return;
         }
         let frames = self.column_spans(&drag.display);
+        let screens = self.screens.clone();
         let Some(dest) = restore::drop_index(&frames, x) else {
+            self.publish_layouts(&screens, &params);
+            self.publish_state(&screens);
             return;
         };
         let visible = self.viewport_of(&drag.display);
         if let Some(strip) = self.strip_mut(&drag.display) {
             let to = dest.min(strip.columns.len().saturating_sub(1));
-            strip.move_column(drag.column, to);
-            strip.reveal(&params, visible);
+            if to != drag.column {
+                strip.move_column(drag.column, to);
+                strip.reveal(&params, visible);
+            }
         }
+        self.publish_layouts(&screens, &params);
+        self.publish_state(&screens);
+    }
+
+    /// A window resized by hand keeps its new width: its column takes that
+    /// width and the strip reflows around it at once, instead of the next tick
+    /// writing the old size back.
+    fn adopt_hand_resize(&mut self, drag: &Drag) -> bool {
+        let Some(motion) = self.motions.get(&drag.id) else {
+            return false;
+        };
+        let (want_w, want_h) = (motion.width, motion.height);
+        let actual = self.pool.with_api_ref(|api| api.read_frame(drag.id));
+        if actual.width < 1.0 || actual.height < 1.0 || ((actual.width - want_w).abs() <= 4.0 && (actual.height - want_h).abs() <= 4.0) {
+            return false;
+        }
+        let visible = self.viewport_of(&drag.display);
+        let params = layout_params(&self.config);
+        let ratio = (actual.width / visible.width.max(1.0)).clamp(0.1, 1.0);
+        let Some(strip) = self.strip_mut(&drag.display) else {
+            return false;
+        };
+        let Some(column) = strip.columns.get_mut(drag.column).filter(|column| column.windows.iter().any(|window| window.id.0 == drag.id)) else {
+            return false;
+        };
+        column.width_ratio = ratio;
+        for window in &mut column.windows {
+            window.size_override = None;
+        }
+        strip.focus = Focus::Column(drag.column);
+        strip.reveal(&params, visible);
+        if let Some(motion) = self.motions.get_mut(&drag.id) {
+            motion.snap(Frame { x: actual.x + motion.offset, ..actual });
+            motion.written = Some((actual.x, actual.y));
+        }
+        self.size_misses.remove(&drag.id);
         let screens = self.screens.clone();
         self.publish_layouts(&screens, &params);
         self.publish_state(&screens);
+        true
     }
 
     fn toggle_float(&mut self) -> Result<(), CommandError> {
@@ -1188,8 +1499,14 @@ impl Runtime {
         Ok(())
     }
 
+    /// The system-focused window, when it is one of the floating windows.
     fn args_window_floating(&self) -> Option<u64> {
-        None
+        let front = ax::frontmost_pid();
+        if front <= 0 {
+            return None;
+        }
+        let id = self.pool.with_api_ref(|api| ax::focused_window(api, front))?;
+        self.floating.contains_key(&id).then_some(id)
     }
 
     fn unfloat(&mut self, id: u64) -> Result<(), CommandError> {
@@ -1199,7 +1516,8 @@ impl Runtime {
         let visible = self.viewport_of(&display);
         let window = Window::new(id, info.pid);
         let space = self.active_space();
-        self.entry_active(&display).insert(window, info.pid.wrapping_add(1), None, &params, visible);
+        // Passing the window's own pid as frontmost focuses the unfloated column.
+        self.entry_active(&display).insert(window, info.pid, None, &params, visible);
         self.meta.insert(
             id,
             Meta {
@@ -1537,7 +1855,7 @@ impl Runtime {
             if self.config.displays.ignored_displays.iter().any(|id| id == &display) {
                 continue;
             }
-            let mut traits = self.pool.with_api(|api| api.describe(window.id));
+            let mut traits = self.pool.with_api_ref(|api| api.describe(window.id));
             if traits.role.is_empty() && traits.subrole.is_empty() {
                 let mut cursor = self.remote_cursors.get(&window.id).copied().unwrap_or(0);
                 let found = self.pool.with_api(|api| ax::resolve_remote(api, window.id, window.pid, &mut cursor, 128));
@@ -1545,7 +1863,7 @@ impl Runtime {
                 if !found {
                     continue;
                 }
-                traits = self.pool.with_api(|api| api.describe(window.id));
+                traits = self.pool.with_api_ref(|api| api.describe(window.id));
                 if traits.role.is_empty() && traits.subrole.is_empty() {
                     traits = standard_window(traits);
                 }
@@ -1638,6 +1956,50 @@ impl Runtime {
         }
     }
 
+    /// Some apps accept a size write and then put their own size back later, so
+    /// the read-back after the write cannot catch them. The window list shows
+    /// the real size each tick: a mismatch is written again once, and a window
+    /// that still keeps its own size gets it, with its column sized to fit.
+    fn check_sizes(&mut self, listed: &[ListedWindow]) {
+        if self.animating || self.drag.is_some() || self.gesture.is_open() {
+            return;
+        }
+        for window in listed {
+            let id = window.id;
+            let Some(motion) = self.motions.get(&id) else {
+                continue;
+            };
+            if !self.shown.contains(&id) || motion.park.is_some() || !motion.settled() || motion.pending_shrink.is_some() {
+                self.size_misses.remove(&id);
+                continue;
+            }
+            let want = (motion.width, motion.height);
+            let got = (window.bounds.width, window.bounds.height);
+            let close = |a: (f64, f64), b: (f64, f64)| (a.0 - b.0).abs() <= 2.0 && (a.1 - b.1).abs() <= 2.0;
+            if close(want, got) || got.0 < 1.0 || got.1 < 1.0 {
+                self.size_misses.remove(&id);
+                continue;
+            }
+            let frame = Frame { x: motion.x.x - motion.offset, y: motion.y.x, width: want.0, height: want.1 };
+            let (pid, bundle) = (motion.pid, motion.bundle_id.clone());
+            let entry = self.size_misses.entry(id).or_insert((0, got));
+            if !close(entry.1, got) {
+                *entry = (0, got);
+            }
+            entry.0 += 1;
+            if entry.0 >= 2 {
+                self.size_misses.remove(&id);
+                for strip in self.strips.values_mut() {
+                    if set_size_override(strip, id, got) {
+                        break;
+                    }
+                }
+            } else {
+                self.pool.publish(pid, id, frame, &bundle);
+            }
+        }
+    }
+
     fn apply_size_overrides(&mut self) {
         let overrides = self.pool.take_size_overrides();
         for (id, size) in overrides {
@@ -1678,8 +2040,8 @@ impl Runtime {
         let width = parked.width.max(sliver);
         let height = parked.height.max(sliver);
         let (x, y) = match flipped {
-            Corner::BottomRight => (display.frame.right() - sliver, display.frame.bottom() - sliver),
-            Corner::BottomLeft => (display.frame.x - width + sliver, display.frame.bottom() - sliver),
+            Corner::BottomRight => (display.frame.right() - sliver, parked.y),
+            Corner::BottomLeft => (display.frame.x - width + sliver, parked.y),
         };
         Some(Frame { x, y, width, height })
     }
@@ -1688,7 +2050,10 @@ impl Runtime {
         if !self.config.focus.focus_follows_mouse || !self.pointer_seen || self.pointer_at.elapsed() < Duration::from_millis(100) {
             return;
         }
-        let Some((id, display, column, _)) = self.window_under(self.pointer_x, self.pointer_y) else {
+        // One decision per pointer rest, so keyboard focus changes are not undone
+        // while the mouse sits still over another window.
+        self.pointer_seen = false;
+        let Some((id, display, column, _)) = self.window_under(self.pointer_x, self.pointer_y, 0.0) else {
             return;
         };
         let Some(strip) = self.strip_mut(&display) else {
@@ -1697,13 +2062,18 @@ impl Runtime {
         if strip.focus == Focus::Column(column) {
             return;
         }
-        let _ = id;
         strip.focus = Focus::Column(column);
+        if let Some(column) = strip.columns.get_mut(column) {
+            if let Some(index) = column.windows.iter().position(|window| window.id.0 == id) {
+                column.focused_window = index;
+            }
+        }
+        self.raise_window(id);
         let screens = self.screens.clone();
         self.publish_state(&screens);
     }
 
-    fn window_under(&self, x: f64, y: f64) -> Option<(u64, String, usize, Frame)> {
+    fn window_under(&self, x: f64, y: f64, margin: f64) -> Option<(u64, String, usize, Frame)> {
         let active = self.active_space();
         for (key, strip) in &self.strips {
             if key.space != active {
@@ -1711,10 +2081,10 @@ impl Runtime {
             }
             for (index, column) in strip.columns.iter().enumerate() {
                 for window in &column.windows {
-                    let Some(frame) = self.last_on_screen.get(&window.id.0).copied() else {
+                    let Some(frame) = self.last_on_screen.get(&window.id.0).copied().filter(|_| self.shown.contains(&window.id.0)) else {
                         continue;
                     };
-                    if x >= frame.x && x < frame.right() && y >= frame.y && y < frame.bottom() {
+                    if x >= frame.x - margin && x < frame.right() + margin && y >= frame.y - margin && y < frame.bottom() + margin {
                         return Some((window.id.0, key.display.clone(), index, frame));
                     }
                 }
@@ -1740,6 +2110,26 @@ impl Runtime {
         }
         spans
     }
+}
+
+fn focus_name(focus: Focus) -> &'static str {
+    match focus {
+        Focus::None => "none",
+        Focus::Column(_) => "column",
+        Focus::PinnedLeft => "pinned_left",
+        Focus::PinnedRight => "pinned_right",
+    }
+}
+
+fn focused_window_id(strip: &Strip) -> Option<u64> {
+    let column = match strip.focus {
+        Focus::Column(index) => strip.columns.get(index),
+        Focus::PinnedLeft => strip.pinned_left.as_ref().map(|pin| &pin.column),
+        Focus::PinnedRight => strip.pinned_right.as_ref().map(|pin| &pin.column),
+        Focus::None => None,
+    }?;
+    let window = column.windows.get(column.focused_window).or_else(|| column.windows.first())?;
+    Some(window.id.0)
 }
 
 fn focused_window(strip: &Strip) -> Option<&Window> {
@@ -1915,10 +2305,11 @@ fn space_id_after_wake(skylight: bool, live_space: u64, fallback_hash: u64) -> u
 fn force_park_sliver(frame: Frame, min_x: f64, max_x: f64, max_y: f64, sliver: f64) -> Frame {
     let width = frame.width.max(sliver);
     let height = frame.height.max(sliver);
+    let _ = max_y;
     if frame.x >= min_x {
-        Frame { x: max_x - sliver, y: max_y - sliver, width, height }
+        Frame { x: max_x - sliver, y: frame.y, width, height }
     } else {
-        Frame { x: min_x - width + sliver, y: max_y - sliver, width, height }
+        Frame { x: min_x - width + sliver, y: frame.y, width, height }
     }
 }
 
@@ -2011,15 +2402,15 @@ mod tests {
 
     #[test]
     fn a_relocated_park_stays_at_one_point() {
-        let layout = Frame { x: 1728.0 - 5.0, y: 1117.0 - 5.0, width: 800.0, height: 600.0 };
+        let layout = Frame { x: 1728.0 - 5.0, y: 41.0, width: 800.0, height: 600.0 };
         let held = force_park_sliver(layout, 0.0, 1728.0, 1117.0, 1.0);
         assert_eq!(held.x, 1727.0);
-        assert_eq!(held.y, 1116.0);
+        assert_eq!(held.y, 41.0);
         assert!((1728.0 - held.x).abs() < 2.0);
-        let left = Frame { x: 0.0 - 800.0 + 5.0, y: 1112.0, width: 800.0, height: 600.0 };
+        let left = Frame { x: 0.0 - 800.0 + 5.0, y: 41.0, width: 800.0, height: 600.0 };
         let held_left = force_park_sliver(left, 0.0, 1728.0, 1117.0, 1.0);
         assert_eq!(held_left.x, 1.0 - 800.0);
-        assert_eq!(held_left.y, 1116.0);
+        assert_eq!(held_left.y, 41.0);
     }
 
     #[test]
@@ -2081,9 +2472,234 @@ mod tests {
         assert!(runtime.park_repaired.contains(&id));
         runtime.screens[0].frame.width = 1600.0;
         runtime.publish_layouts(&runtime.screens.clone(), &params);
-        let target = runtime.motions.get(&id).expect("parked motion").x.target;
-        assert_eq!(target, 1599.0);
-        assert!((1600.0 - target - 1.0).abs() < 0.01);
+        let park = runtime.motions.get(&id).and_then(|motion| motion.park).expect("parked motion");
+        assert_eq!(park.x, 1599.0);
+        assert!((1600.0 - park.x - 1.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn a_pinned_window_resolves_to_its_display() {
+        let mut runtime = Runtime::blank(false);
+        runtime.screens = vec![screen(1728.0)];
+        let mut strip = Strip::new();
+        strip.insert_at(Window::new(7, 1), 0, 0.5);
+        strip.focus = Focus::Column(0);
+        let params = layout_params(&runtime.config);
+        let visible = viewport_for_display(&runtime.screens, "main");
+        strip.pin_left(&params, visible);
+        assert!(matches!(strip.focus, Focus::PinnedLeft));
+        runtime.strips.insert(StripKey { display: "main".into(), space: 0 }, strip);
+        let (display, _) = runtime.locate_window(7).expect("pinned window");
+        assert_eq!(display, "main");
+        runtime.publish_state(&runtime.screens);
+        let text = runtime.snapshot();
+        let focus = text["displays"][0]["strips"][0]["focus"].as_str();
+        let window = text["displays"][0]["strips"][0]["focused_window"].as_u64();
+        assert_eq!(focus, Some("pinned_left"));
+        assert_eq!(window, Some(7));
+    }
+
+    fn swipe_runtime() -> Runtime {
+        let mut runtime = Runtime::blank(false);
+        runtime.screens = vec![screen(1728.0)];
+        let mut strip = Strip::new();
+        for (index, id) in [910_001u64, 910_002, 910_003, 910_004].into_iter().enumerate() {
+            strip.insert_at(Window::new(id, 424_243), index, 0.5);
+            runtime.meta.insert(
+                id,
+                Meta {
+                    pid: 424_243,
+                    bundle_id: "example.swipe".into(),
+                    title: format!("Swipe {index}"),
+                    owner: "Swipe".into(),
+                    display: "main".into(),
+                    space: 0,
+                    role: "AXWindow".into(),
+                    subrole: "AXStandardWindow".into(),
+                },
+            );
+        }
+        strip.focus = Focus::Column(0);
+        runtime.strips.insert(StripKey { display: "main".into(), space: 0 }, strip);
+        let params = layout_params(&runtime.config);
+        runtime.publish_layouts(&runtime.screens.clone(), &params);
+        runtime
+    }
+
+    #[test]
+    fn swipe_frames_track_the_fingers_without_a_spring() {
+        let mut runtime = swipe_runtime();
+        let before = runtime.last_on_screen[&910_002].x;
+        assert!(!runtime.drive_swipe(4, 0.0, 0.0, "began").updated);
+        let notice = runtime.drive_swipe(4, -0.1, 0.0, "moved");
+        assert!(notice.started && notice.updated);
+        let scroll = runtime.strip("main").expect("strip").scroll_x;
+        assert!(scroll > 100.0, "scroll {scroll}");
+        let shown = runtime.last_on_screen[&910_002].x;
+        assert!(runtime.motions[&910_002].settled());
+        assert!((shown - (before - scroll)).abs() < 1.0, "x {shown} before {before} scroll {scroll}");
+        assert!(!runtime.is_animating());
+    }
+
+    #[test]
+    fn a_fling_hands_its_velocity_to_the_snap_spring() {
+        let mut runtime = swipe_runtime();
+        runtime.drive_swipe(4, 0.0, 0.0, "began");
+        runtime.drive_swipe(4, -0.05, 0.0, "moved");
+        runtime.drive_swipe(4, -0.05, 0.0, "moved");
+        let notice = runtime.drive_swipe(4, 0.0, 0.0, "ended");
+        assert!(notice.updated);
+        let view = runtime.views[&runtime.key_of("main")];
+        assert!(view.v > 0.0 && view.v <= MAX_FLING, "velocity {}", view.v);
+        assert!(runtime.is_animating());
+    }
+
+    #[test]
+    fn a_window_that_keeps_its_own_width_gets_a_column_that_fits() {
+        let mut runtime = swipe_runtime();
+        let params = layout_params(&runtime.config);
+        let first = runtime.last_on_screen[&910_001];
+        let listed = vec![ListedWindow {
+            id: 910_001,
+            pid: 424_243,
+            title: "Swipe 0".into(),
+            owner: "Swipe".into(),
+            bounds: Frame { x: first.x, y: first.y, width: 1200.0, height: first.height },
+            space: 0,
+        }];
+        runtime.check_sizes(&listed);
+        assert!(runtime.size_misses.contains_key(&910_001));
+        runtime.check_sizes(&listed);
+        runtime.publish_layouts(&runtime.screens.clone(), &params);
+        while runtime.is_animating() {
+            runtime.step_animation(1.0 / 120.0);
+        }
+        let wide = runtime.last_on_screen[&910_001];
+        assert_eq!(wide.width, 1200.0);
+        let next = runtime.motions[&910_002].x.target - runtime.motions[&910_002].offset;
+        assert!((next - (wide.x + 1200.0 + params.gap_inner)).abs() < 0.5, "next {next} wide {wide:?}");
+    }
+
+    #[test]
+    fn a_swipe_that_goes_quiet_snaps_and_resumes() {
+        let mut runtime = swipe_runtime();
+        runtime.drive_swipe(4, 0.0, 0.0, "began");
+        runtime.drive_swipe(4, -0.1, 0.0, "moved");
+        runtime.swipe_at = Some(Instant::now() - Duration::from_secs(1));
+        runtime.expire_swipe();
+        assert!(!runtime.gesture.is_open());
+        assert!(runtime.swipe_deadline().is_none());
+        let scroll = runtime.strip("main").expect("strip").scroll_x;
+        let view = SwipeView::from_ratios(&[0.5; 4], 1728.0, runtime.config.layout.gap_inner, 1.0, true, 4.0);
+        let inner = 1728.0 - 2.0 * runtime.config.layout.gap_outer;
+        let (snapped, _) = strip_core::snap_column(scroll, &view.spans, inner, false);
+        assert!((scroll - snapped).abs() < 1e-6, "scroll {scroll} is not a column snap");
+        let notice = runtime.drive_swipe(4, -0.1, 0.0, "moved");
+        assert!(runtime.gesture.is_open());
+        assert!(!notice.updated || runtime.strip("main").expect("strip").scroll_x != scroll);
+    }
+
+    #[test]
+    fn a_keyboard_scroll_moves_the_strip_as_one_piece() {
+        let mut runtime = swipe_runtime();
+        let params = layout_params(&runtime.config);
+        let first = runtime.last_on_screen[&910_001].x;
+        runtime.strip_mut("main").expect("strip").scroll_x = 1744.0;
+        runtime.publish_layouts(&runtime.screens.clone(), &params);
+        assert!(runtime.is_animating());
+        // The column that is leaving is still where it was on the first frame.
+        assert!(runtime.motions[&910_001].park.is_none());
+        assert!((runtime.last_on_screen[&910_001].x - first).abs() < 0.5);
+        let mut frames = 0;
+        let mut checked = 0;
+        while runtime.is_animating() && frames < 600 {
+            runtime.step_animation(1.0 / 120.0);
+            frames += 1;
+            // Every fully visible column sits at its strip place minus the shared scroll.
+            let scroll = runtime.views[&runtime.key_of("main")].x;
+            for (index, id) in [910_001u64, 910_002, 910_003, 910_004].into_iter().enumerate() {
+                if runtime.motions[&id].park.is_some() {
+                    continue;
+                }
+                let frame = runtime.last_on_screen[&id];
+                if frame.x >= 0.0 && frame.right() <= 1728.0 {
+                    let expected = 8.0 + index as f64 * (864.0 + params.gap_inner) - scroll;
+                    assert!((frame.x - expected).abs() < 0.5, "frame {frames} window {id} x {} expected {expected}", frame.x);
+                    checked += 1;
+                }
+            }
+        }
+        assert!(!runtime.is_animating(), "still animating after {frames} frames");
+        assert!(frames > 10);
+        assert!(checked > 0);
+        assert!(runtime.motions[&910_001].park.is_some());
+        let landed = runtime.last_on_screen[&910_003].x;
+        assert!((landed - (8.0 + 2.0 * 872.0 - 1744.0)).abs() < 0.5, "landed {landed}");
+    }
+
+    #[test]
+    fn a_column_scrolled_into_view_starts_at_its_strip_place() {
+        let mut runtime = swipe_runtime();
+        let params = layout_params(&runtime.config);
+        assert!(runtime.motions[&910_003].park.is_some());
+        runtime.strip_mut("main").expect("strip").scroll_x = 872.0;
+        runtime.publish_layouts(&runtime.screens.clone(), &params);
+        runtime.step_animation(1.0 / 120.0);
+        let scroll = runtime.views[&runtime.key_of("main")].x;
+        assert!(scroll > 0.0 && scroll < 872.0, "scroll {scroll}");
+        if let Some(entered) = runtime.last_on_screen.get(&910_003).filter(|_| runtime.motions[&910_003].park.is_none()) {
+            let expected = 8.0 + 2.0 * 872.0 - scroll;
+            assert!((entered.x - expected).abs() < 6.0, "x {} expected {expected}", entered.x);
+        }
+        while runtime.is_animating() {
+            runtime.step_animation(1.0 / 120.0);
+        }
+        let entered = runtime.last_on_screen[&910_003];
+        assert!(runtime.motions[&910_003].park.is_none());
+        assert!((entered.x - (8.0 + 2.0 * 872.0 - 872.0)).abs() < 0.5, "x {}", entered.x);
+    }
+
+    #[test]
+    fn a_hand_resized_window_keeps_its_width_and_the_strip_reflows() {
+        let mut runtime = swipe_runtime();
+        let params = layout_params(&runtime.config);
+        let first = runtime.last_on_screen[&910_001];
+        runtime.pool.with_api(|api| {
+            api.frames.insert(910_001, Frame { width: 1100.0, ..first });
+        });
+        runtime.note_pointer(1, first.right() + 1.0, first.y + 300.0);
+        runtime.note_pointer(2, first.x + 1100.0, first.y + 300.0);
+        let ratio = runtime.strip("main").expect("strip").columns[0].width_ratio;
+        assert!((ratio - 1100.0 / 1728.0).abs() < 1e-6, "ratio {ratio}");
+        while runtime.is_animating() {
+            runtime.step_animation(1.0 / 120.0);
+        }
+        let scroll = runtime.strip("main").expect("strip").scroll_x;
+        let second = runtime.last_on_screen[&910_002];
+        let expected = first.x + 1100.0 + params.gap_inner - scroll;
+        assert!((second.x - expected).abs() < 0.5, "x {} expected {expected}", second.x);
+        assert!((runtime.motions[&910_001].width - 1100.0).abs() < 0.5);
+    }
+
+    #[test]
+    fn a_click_inside_a_window_changes_no_width() {
+        let mut runtime = swipe_runtime();
+        let first = runtime.last_on_screen[&910_001];
+        runtime.note_pointer(1, first.x + 100.0, first.y + 300.0);
+        runtime.note_pointer(2, first.x + 101.0, first.y + 300.0);
+        assert_eq!(runtime.strip("main").expect("strip").columns[0].width_ratio, 0.5);
+    }
+
+    #[test]
+    fn state_changes_are_taken_once() {
+        let runtime = swipe_runtime();
+        runtime.publish_state(&runtime.screens);
+        let version = runtime.state_version();
+        assert!(runtime.take_state_change().is_some());
+        assert!(runtime.take_state_change().is_none());
+        runtime.publish_state(&runtime.screens);
+        assert_eq!(runtime.state_version(), version);
+        assert!(runtime.take_state_change().is_none());
     }
 
     #[test]

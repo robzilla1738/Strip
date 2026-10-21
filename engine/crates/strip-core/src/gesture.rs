@@ -16,6 +16,10 @@ pub struct SwipeView {
     pub natural: bool,
     pub deceleration: f64,
     pub spans: Vec<(f64, f64)>,
+    /// Width the columns scroll through: the viewport less outer gaps and pins.
+    pub view_width: f64,
+    /// Snap stops center a column instead of lining up one of its edges.
+    pub center: bool,
 }
 
 impl SwipeView {
@@ -43,12 +47,20 @@ impl SwipeView {
             natural,
             deceleration,
             spans,
+            view_width: viewport_width,
+            center: false,
         }
+    }
+
+    pub fn with_view(mut self, view_width: f64, center: bool) -> Self {
+        self.view_width = view_width;
+        self.center = center;
+        self
     }
 
     pub fn limits(&self) -> (f64, f64) {
         let content = self.spans.last().map(|(prefix, width)| prefix + width).unwrap_or(0.0);
-        (0.0, (content - self.viewport_width).max(0.0))
+        (0.0, (content - self.view_width).max(0.0))
     }
 }
 
@@ -88,6 +100,20 @@ impl Gesture {
 
     pub fn is_armed(&self) -> bool {
         self.armed
+    }
+
+    pub fn is_open(&self) -> bool {
+        self.open
+    }
+
+    /// Drops the tracked velocity, so a release after a pause snaps without a fling.
+    pub fn rest(&mut self) {
+        self.velocity = 0.0;
+    }
+
+    /// Smoothed scroll velocity of the last tracked frames, in points per second.
+    pub fn velocity(&self) -> f64 {
+        self.velocity
     }
 
     pub fn begin(&mut self, fingers: u8, wanted: u8, scroll: f64) {
@@ -154,7 +180,7 @@ impl Gesture {
             scroll = rubber_band(scroll + velocity * dt, min, max);
             elapsed += dt;
         }
-        let (snapped, index) = snap_column(scroll, &view.spans, view.viewport_width);
+        let (snapped, index) = snap_column(scroll, &view.spans, view.view_width, view.center);
         self.scroll = snapped;
         SwipeUpdate { scroll: Some(snapped), focus: Some(index) }
     }
@@ -186,7 +212,11 @@ pub fn decay_velocity(velocity: f64, deceleration: f64, dt: f64) -> f64 {
     velocity * (-deceleration * dt).exp()
 }
 
-pub fn snap_column(scroll: f64, spans: &[(f64, f64)], viewport: f64) -> (f64, usize) {
+/// The nearest scroll stop and the column it lands on. Without centering, a
+/// stop lines up a column's left edge with the viewport's left edge or its right
+/// edge with the viewport's right edge, so whole columns show, as the keyboard
+/// leaves them.
+pub fn snap_column(scroll: f64, spans: &[(f64, f64)], viewport: f64, center: bool) -> (f64, usize) {
     if spans.is_empty() || viewport <= 0.0 {
         return (0.0, 0);
     }
@@ -196,12 +226,19 @@ pub fn snap_column(scroll: f64, spans: &[(f64, f64)], viewport: f64) -> (f64, us
     let mut best_index = 0;
     let mut best_distance = f64::MAX;
     for (index, (prefix, width)) in spans.iter().enumerate() {
-        let target = (prefix + width / 2.0 - viewport / 2.0).clamp(0.0, max);
-        let distance = (target - scroll).abs();
-        if distance < best_distance {
-            best_distance = distance;
-            best_scroll = target;
-            best_index = index;
+        let stops = if center {
+            [Some(prefix + width / 2.0 - viewport / 2.0), None]
+        } else {
+            [Some(*prefix), Some(prefix + width - viewport)]
+        };
+        for stop in stops.into_iter().flatten() {
+            let target = stop.clamp(0.0, max);
+            let distance = (target - scroll).abs();
+            if distance < best_distance - 1e-9 {
+                best_distance = distance;
+                best_scroll = target;
+                best_index = index;
+            }
         }
     }
     (best_scroll, best_index)
@@ -234,10 +271,19 @@ mod tests {
     #[test]
     fn snap_picks_the_column_center_nearest_the_viewport() {
         let spans = [(0.0, 400.0), (408.0, 400.0), (816.0, 400.0)];
-        let (scroll, index) = snap_column(180.0, &spans, 800.0);
+        let (scroll, index) = snap_column(180.0, &spans, 800.0, true);
         assert_eq!(index, 1);
         let center = 408.0 + 200.0 - 400.0;
         assert!((scroll - center).abs() < 1e-6, "scroll {scroll}");
+    }
+
+    #[test]
+    fn snap_without_centering_shows_whole_columns() {
+        let spans = [(0.0, 400.0), (408.0, 400.0), (816.0, 400.0), (1224.0, 400.0)];
+        let (scroll, index) = snap_column(380.0, &spans, 800.0, false);
+        assert_eq!((scroll, index), (408.0, 1));
+        let (end, last) = snap_column(900.0, &spans, 800.0, false);
+        assert_eq!((end, last), (824.0, 3));
     }
 
     #[test]

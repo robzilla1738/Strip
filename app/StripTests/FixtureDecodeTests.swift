@@ -14,6 +14,7 @@ final class FixtureDecodeTests: XCTestCase {
         for file in files {
             let data = try Data(contentsOf: file)
             let line = try JSONDecoder().decode(WireLine.self, from: data)
+            XCTAssertEqual(WireLine.parse(data), line, file.lastPathComponent)
             XCTAssertFalse(line.type.isEmpty, file.lastPathComponent)
             switch line.type {
             case "hello":
@@ -43,6 +44,25 @@ final class FixtureDecodeTests: XCTestCase {
             default:
                 XCTFail("unknown type \(line.type) in \(file.lastPathComponent)")
             }
+        }
+    }
+
+    func testFastParseMatchesCodable() throws {
+        let samples = [
+            #"{"type":"event","event":"state","data":{"a":[1,2.5,3.0,-4,true,false,null,"x"],"b":{"c":1e3}}}"#,
+            #"{"id":7,"type":"result","ok":true,"data":null}"#,
+            #"{"id":8,"type":"result","ok":false,"error":{"code":"bad","message":"nope"}}"#,
+            #"{"type":"hello","protocol":1,"engine_version":"1","ax_trusted":false,"private_api":{"skylight":true,"ax_get_window":false}}"#,
+        ]
+        for sample in samples {
+            let data = Data(sample.utf8)
+            XCTAssertEqual(WireLine.parse(data), try JSONDecoder().decode(WireLine.self, from: data), sample)
+        }
+        let rejected = [#"{"id":-1,"type":"result"}"#, #"{"type":3}"#, #"{"type":"result","ok":1}"#, #"[1]"#, "not json"]
+        for sample in rejected {
+            let data = Data(sample.utf8)
+            XCTAssertNil(WireLine.parse(data), sample)
+            XCTAssertNil(try? JSONDecoder().decode(WireLine.self, from: data), sample)
         }
     }
 }

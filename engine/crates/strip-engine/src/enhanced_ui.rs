@@ -14,15 +14,24 @@ pub struct EnhancedGuard {
 }
 
 impl EnhancedGuard {
-    pub fn before_write<A: WindowApi + ?Sized>(&mut self, api: &mut A, pid: i32, now: Instant) {
-        if !self.restore.contains_key(&pid) && api.enhanced_ui(pid) {
-            api.set_enhanced_ui(pid, false);
-            self.restore.insert(pid, true);
+    /// Reads the attribute once per burst of writes. A pid whose attribute was
+    /// already off is remembered as `false` so later writes skip the AX read.
+    pub fn before_write<A: WindowApi + ?Sized>(&mut self, api: &A, pid: i32, now: Instant) {
+        if let std::collections::hash_map::Entry::Vacant(slot) = self.restore.entry(pid) {
+            let enabled = api.enhanced_ui(pid);
+            if enabled {
+                api.set_enhanced_ui(pid, false);
+            }
+            slot.insert(enabled);
         }
         self.last_write.insert(pid, now);
     }
 
-    pub fn restore_due<A: WindowApi + ?Sized>(&mut self, api: &mut A, now: Instant) {
+    pub fn note_write(&mut self, pid: i32, now: Instant) {
+        self.last_write.insert(pid, now);
+    }
+
+    pub fn restore_due<A: WindowApi + ?Sized>(&mut self, api: &A, now: Instant) {
         let due: Vec<i32> = self
             .last_write
             .iter()
@@ -50,11 +59,11 @@ mod tests {
     mock! {
         pub Api {}
         impl WindowApi for Api {
-            fn write_size(&mut self, window: u64, width: f64, height: f64);
-            fn write_position(&mut self, window: u64, x: f64, y: f64);
-            fn read_frame(&mut self, window: u64) -> Frame;
-            fn enhanced_ui(&mut self, pid: i32) -> bool;
-            fn set_enhanced_ui(&mut self, pid: i32, enabled: bool);
+            fn write_size(&self, window: u64, width: f64, height: f64);
+            fn write_position(&self, window: u64, x: f64, y: f64);
+            fn read_frame(&self, window: u64) -> Frame;
+            fn enhanced_ui(&self, pid: i32) -> bool;
+            fn set_enhanced_ui(&self, pid: i32, enabled: bool);
         }
     }
 
@@ -71,14 +80,14 @@ mod tests {
 
         let start = Instant::now();
         let mut guard = EnhancedGuard::default();
-        guard.before_write(&mut api, 7, start);
+        guard.before_write(&api, 7, start);
         assert!(!enabled.load(Ordering::SeqCst));
 
-        guard.before_write(&mut api, 7, start + Duration::from_millis(100));
-        guard.restore_due(&mut api, start + Duration::from_millis(349));
+        guard.before_write(&api, 7, start + Duration::from_millis(100));
+        guard.restore_due(&api, start + Duration::from_millis(349));
         assert!(!enabled.load(Ordering::SeqCst));
 
-        guard.restore_due(&mut api, start + Duration::from_millis(350));
+        guard.restore_due(&api, start + Duration::from_millis(350));
         assert!(enabled.load(Ordering::SeqCst));
     }
 
@@ -93,8 +102,8 @@ mod tests {
 
         let start = Instant::now();
         let mut guard = EnhancedGuard::default();
-        guard.before_write(&mut api, 7, start);
-        guard.restore_due(&mut api, start + Duration::from_millis(250));
+        guard.before_write(&api, 7, start);
+        guard.restore_due(&api, start + Duration::from_millis(250));
         assert!(!enabled.load(Ordering::SeqCst));
     }
 }

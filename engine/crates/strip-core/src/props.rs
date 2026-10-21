@@ -168,9 +168,10 @@ proptest! {
             if item.visibility != Visibility::Hidden {
                 continue;
             }
-            let (width, height) = overlap(item.frame, display);
+            let (width, _) = overlap(item.frame, display);
             prop_assert!(width <= allowed + 1e-4);
-            prop_assert!(height <= allowed + 1e-4);
+            prop_assert!(item.frame.y + 1e-4 >= display.min_y);
+            prop_assert!(item.frame.bottom() <= display.max_y + 1e-4);
         }
     }
 }

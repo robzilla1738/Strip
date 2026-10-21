@@ -26,13 +26,13 @@ center_focused_column = "never"   # never | on_overflow | always
 keep_original_height = false
 
 [animation]
-animation_duration_ms = 500
+animation_duration_ms = 250
 animation_damping = 0.9
 
 [swipe]
 swipe_fingers = 4        # 0 | 3 | 4 | 5
 swipe_natural = true
-swipe_sensitivity = 1.0
+swipe_sensitivity = 1.5
 swipe_deceleration = 4.0
 
 [focus]
@@ -128,7 +128,7 @@ pub struct Animation {
 impl Default for Animation {
     fn default() -> Self {
         Self {
-            animation_duration_ms: 500,
+            animation_duration_ms: 250,
             animation_damping: 0.9,
         }
     }
@@ -148,7 +148,7 @@ impl Default for Swipe {
         Self {
             swipe_fingers: 4,
             swipe_natural: true,
-            swipe_sensitivity: 1.0,
+            swipe_sensitivity: 1.5,
             swipe_deceleration: 4.0,
         }
     }
@@ -443,11 +443,11 @@ mod tests {
         assert!(parsed.layout.dock_aware);
         assert_eq!(parsed.layout.center_focused_column, CenterMode::Never);
         assert!(!parsed.layout.keep_original_height);
-        assert_eq!(parsed.animation.animation_duration_ms, 500);
+        assert_eq!(parsed.animation.animation_duration_ms, 250);
         assert_eq!(parsed.animation.animation_damping, 0.9);
         assert_eq!(parsed.swipe.swipe_fingers, 4);
         assert!(parsed.swipe.swipe_natural);
-        assert_eq!(parsed.swipe.swipe_sensitivity, 1.0);
+        assert_eq!(parsed.swipe.swipe_sensitivity, 1.5);
         assert_eq!(parsed.swipe.swipe_deceleration, 4.0);
         assert!(!parsed.focus.focus_follows_mouse);
         assert!(!parsed.focus.mouse_follows_focus);

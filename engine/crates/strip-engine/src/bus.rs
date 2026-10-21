@@ -67,10 +67,20 @@ impl Bus {
 
     pub fn emit(&self, event: &str, data: serde_json::Value) {
         let line = strip_ipc::encode(&strip_ipc::ServerMessage::Event { event: event.to_string(), data });
-        let line = line.trim_end().to_string();
+        self.send(event, line.trim_end());
+    }
+
+    /// Emits an event whose `data` is already serialized JSON, skipping a parse and re-encode.
+    pub fn emit_raw(&self, event: &str, data: &str) {
+        let name = serde_json::to_string(event).unwrap_or_else(|_| "\"\"".to_string());
+        let line = format!("{{\"type\":\"event\",\"event\":{name},\"data\":{data}}}");
+        self.send(event, &line);
+    }
+
+    fn send(&self, event: &str, line: &str) {
         for subscriber in lock(&self.subscribers).iter() {
             if subscriber.events.iter().any(|name| name == event) {
-                let _ = subscriber.tx.send(line.clone());
+                let _ = subscriber.tx.send(line.to_string());
             }
         }
     }
@@ -84,4 +94,23 @@ impl Default for Bus {
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|err| err.into_inner())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Bus;
+
+    #[test]
+    fn raw_events_match_encoded_events() {
+        let bus = Bus::new();
+        let (_, rx) = bus.subscribe(vec!["state".to_string()]);
+        let data = serde_json::json!({ "managing": true, "displays": [] });
+        bus.emit("state", data.clone());
+        bus.emit_raw("state", &data.to_string());
+        bus.emit_raw("focus", "{}");
+        let encoded: serde_json::Value = serde_json::from_str(&rx.recv().unwrap()).unwrap();
+        let raw: serde_json::Value = serde_json::from_str(&rx.recv().unwrap()).unwrap();
+        assert_eq!(encoded, raw);
+        assert!(rx.try_recv().is_err());
+    }
 }

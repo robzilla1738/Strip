@@ -4,7 +4,7 @@ use std::cell::Cell;
 use std::os::raw::{c_void, c_uint};
 use std::ptr;
 use std::sync::atomic::{AtomicPtr, Ordering};
-
+use std::time::{Duration, Instant};
 
 use crate::bindings::Binding;
 use crate::bus::Bus;
@@ -22,9 +22,16 @@ const FLAG_CONTROL: u64 = 0x0004_0000;
 const FLAG_ALTERNATE: u64 = 0x0008_0000;
 const FLAG_COMMAND: u64 = 0x0010_0000;
 
+const LISTEN_ONLY: u32 = 1;
+/// A swipe re-announces the indicator at most this often so it stays up without flooding the app.
+const SWIPE_INDICATOR_EVERY: Duration = Duration::from_millis(150);
+
 thread_local! {
     static CONTEXT: Cell<*mut TapContext> = const { Cell::new(ptr::null_mut()) };
     static TAP_PORT: Cell<*mut c_void> = const { Cell::new(ptr::null_mut()) };
+    static LISTEN_PORT: Cell<*mut c_void> = const { Cell::new(ptr::null_mut()) };
+    static HELD: Cell<bool> = const { Cell::new(false) };
+    static SWIPE_ANNOUNCED: Cell<Option<Instant>> = const { Cell::new(None) };
 }
 
 static MAIN_LOOP: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
@@ -38,10 +45,16 @@ pub fn main_loop() -> *mut c_void {
     MAIN_LOOP.load(Ordering::SeqCst)
 }
 
+/// Ends the current `pump` so the main loop handles the new work now.
+/// `CFRunLoopWakeUp` alone does not return from `CFRunLoopRunInMode`.
+/// A stop that lands between pumps makes the next pump return at once.
 pub fn wake_main() {
     let run_loop = MAIN_LOOP.load(Ordering::SeqCst);
     if !run_loop.is_null() {
-        unsafe { CFRunLoopWakeUp(run_loop) };
+        unsafe {
+            CFRunLoopStop(run_loop);
+            CFRunLoopWakeUp(run_loop);
+        }
     }
 }
 
@@ -53,6 +66,14 @@ struct TapContext {
 pub struct EventTap {
     port: *mut c_void,
     source: *mut c_void,
+}
+
+fn reenable_taps() {
+    for port in [TAP_PORT.with(|cell| cell.get()), LISTEN_PORT.with(|cell| cell.get())] {
+        if !port.is_null() {
+            unsafe { CGEventTapEnable(port, 1) };
+        }
+    }
 }
 
 impl EventTap {
@@ -68,18 +89,27 @@ pub fn enable_tap() -> bool {
         eprintln!("event tap unavailable");
         return false;
     }
-    unsafe { CGEventTapEnable(port, 1) };
+    reenable_taps();
     eprintln!("event tap enabled");
     true
 }
 
+/// Two taps. Only key-downs need an active tap, because a matched shortcut is
+/// swallowed. Mouse, modifier, and gesture events go through a listen-only tap,
+/// so the system never waits on this thread to deliver them.
 pub fn install() -> Option<EventTap> {
-    let mask = event_mask();
-    let port = unsafe {
-        CGEventTapCreate(0, 0, 0, mask, tap_callback, ptr::null_mut())
-    };
+    let keys = create_tap(0, key_mask())?;
+    TAP_PORT.with(|cell| cell.set(keys.port));
+    match create_tap(LISTEN_ONLY, listen_mask()) {
+        Some(listen) => LISTEN_PORT.with(|cell| cell.set(listen.port)),
+        None => eprintln!("listen tap unavailable"),
+    }
+    Some(keys)
+}
+
+fn create_tap(options: u32, mask: u64) -> Option<EventTap> {
+    let port = unsafe { CGEventTapCreate(0, 0, options, mask, tap_callback, ptr::null_mut()) };
     if port.is_null() {
-        eprintln!("event tap unavailable");
         return None;
     }
     let source = unsafe { CFMachPortCreateRunLoopSource(ptr::null(), port, 0) };
@@ -91,7 +121,6 @@ pub fn install() -> Option<EventTap> {
         CFRunLoopAddSource(CFRunLoopGetCurrent(), source, kCFRunLoopCommonModes);
         CGEventTapEnable(port, 1);
     }
-    TAP_PORT.with(|cell| cell.set(port));
     Some(EventTap { port, source })
 }
 
@@ -107,8 +136,12 @@ pub fn pump(runtime: &mut Runtime, bus: &Bus, seconds: f64) {
     CONTEXT.with(|cell| cell.set(ptr::null_mut()));
 }
 
-fn event_mask() -> u64 {
-    let types = [1_u32, 2, 5, 6, 10, 11, 12, 22, 29];
+fn key_mask() -> u64 {
+    1_u64 << KEY_DOWN
+}
+
+fn listen_mask() -> u64 {
+    let types = [1_u32, 2, 5, 6, FLAGS_CHANGED, 29];
     types.iter().fold(0_u64, |mask, kind| mask | (1_u64 << kind))
 }
 
@@ -119,10 +152,7 @@ extern "C" fn tap_callback(
     _user: *mut c_void,
 ) -> *mut c_void {
     if event_type == TAP_DISABLED_BY_TIMEOUT || event_type == TAP_DISABLED_BY_USER {
-        let port = TAP_PORT.with(|cell| cell.get());
-        if !port.is_null() {
-            unsafe { CGEventTapEnable(port, 1) };
-        }
+        reenable_taps();
         return event;
     }
     let ctx_ptr = CONTEXT.with(|cell| cell.get());
@@ -133,7 +163,27 @@ extern "C" fn tap_callback(
     let runtime = unsafe { &mut *ctx.runtime };
     let bus = unsafe { &*ctx.bus };
     if event_type == 29 {
-        if swipe::observe(runtime, event_type, event) {
+        let notice = swipe::observe(runtime, event_type, event);
+        if notice.updated || notice.started {
+            command::flush_state(runtime, bus);
+            let now = Instant::now();
+            let due = notice.started
+                || SWIPE_ANNOUNCED.with(|cell| cell.get()).is_none_or(|then| now.duration_since(then) >= SWIPE_INDICATOR_EVERY);
+            if due {
+                SWIPE_ANNOUNCED.with(|cell| cell.set(Some(now)));
+                if let Some(display) = runtime.primary_display() {
+                    bus.emit(
+                        "indicator",
+                        serde_json::json!({
+                            "display": display,
+                            "show": true,
+                            "hold": false,
+                        }),
+                    );
+                }
+            }
+        }
+        if notice.started {
             bus.emit("tour", serde_json::json!({ "action": "swipe" }));
         }
         return event;
@@ -170,9 +220,13 @@ extern "C" fn tap_callback(
     ptr::null_mut()
 }
 
+/// Announces only changes of the ⌃⌥ hold, not every modifier press.
 fn emit_hold(runtime: &Runtime, bus: &Bus, event: *mut c_void) {
     let flags = unsafe { CGEventGetFlags(event) };
     let held = flags & FLAG_CONTROL != 0 && flags & FLAG_ALTERNATE != 0;
+    if HELD.with(|cell| cell.replace(held)) == held {
+        return;
+    }
     let Some(display) = runtime.primary_display() else {
         return;
     };
@@ -218,4 +272,5 @@ extern "C" {
     fn CFRunLoopAddSource(run_loop: *mut c_void, source: *mut c_void, mode: *const c_void);
     fn CFRunLoopRunInMode(mode: *const c_void, seconds: f64, return_after_source: u8) -> i32;
     fn CFRunLoopWakeUp(run_loop: *mut c_void);
+    fn CFRunLoopStop(run_loop: *mut c_void);
 }

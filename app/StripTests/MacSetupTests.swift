@@ -58,6 +58,15 @@ final class MacSetupTests: XCTestCase {
         XCTAssertEqual(hit.quit.map(\.bundleID), ["com.knollsoft.Rectangle"])
     }
 
+    func testControlAccessNameFollowsTheOS() {
+        XCTAssertEqual(ControlAccess.paneName(major: 13), "Accessibility")
+        XCTAssertEqual(ControlAccess.paneName(major: 26), "Accessibility")
+        XCTAssertEqual(ControlAccess.paneName(major: 27), "Device Control and Data Access")
+        XCTAssertTrue(FixLink.accessibility.contains("PrivacySecurity.extension"))
+        XCTAssertTrue(FixLink.accessibility.contains("Privacy_Accessibility"))
+        XCTAssertFalse(FixLink.accessibility.contains("preference.security"))
+    }
+
     func testTourAdvancesOnSyntheticEvents() {
         let tour = TourProgress()
         tour.receive("focus_right")

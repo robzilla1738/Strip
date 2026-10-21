@@ -128,10 +128,13 @@ for frame in frames:
     disp_h = max(0.0, min(y + h, dbottom) - max(y, dy0))
     if abs(w - expected) < 40:
         resized += 1
-    # A sliver in either viewport axis is off the strip. Both display axes must be ≤ 5.
+    # Parked windows keep the strip row (DECISIONS: Parked windows stay on the strip row).
+    # Only a sliver of width may show, and the window stays vertically on the display.
     if on_w <= 5.5 or on_h <= 5.5:
-        if disp_w > 5.5 or disp_h > 5.5:
+        if disp_w > 5.5:
             raise SystemExit(f"off-viewport window exposes {disp_w:.1f}x{disp_h:.1f}: {frame}")
+        if y + 0.5 < dy0 or y + h > dbottom + 0.5:
+            raise SystemExit(f"parked window left the display rows: {frame}")
         parked += 1
     elif disp_w + 0.5 < 5 or disp_h + 0.5 < 5:
         raise SystemExit(f"partial window lost its sliver: {frame}")
@@ -140,7 +143,7 @@ if resized < 1:
     raise SystemExit(f"no window was resized to the default column width {expected}: {frames}")
 if len(frames) >= 6 and len(frames) * expected > vw + 1 and parked < 1:
     raise SystemExit(f"expected a parked window among {frames}")
-print("off-viewport windows expose ≤5×5 pt")
+print("off-viewport windows expose ≤5 pt of width")
 PY
 
 "$CLI" --socket "$SOCKET" focus_index 3
@@ -281,7 +284,7 @@ python3 -c '
 import sys
 before, moved, width = map(float, sys.argv[1:])
 delta = moved - before
-expected = 0.5 * width
+expected = 0.5 * 1.5 * width  # default swipe_sensitivity
 if abs(delta - expected) > 2.0:
     raise SystemExit(f"scroll delta {delta:.2f} expected {expected:.2f} before {before:.2f} moved {moved:.2f}")
 print(f"swipe moved delta={delta:.2f}")
@@ -303,8 +306,11 @@ for index, ratio in enumerate(ratios):
     if index + 1 != len(ratios):
         cursor += gap
 content = spans[-1][0] + spans[-1][1]
-limit = max(0.0, content - width)
-targets = [min(limit, max(0.0, prefix + column / 2.0 - width / 2.0)) for prefix, column in spans]
+view = width - 2.0 * gap
+limit = max(0.0, content - view)
+# Default centre mode is never: stops line up a column edge with a viewport edge.
+stops = [stop for prefix, column in spans for stop in (prefix, prefix + column - view)]
+targets = sorted({min(limit, max(0.0, stop)) for stop in stops})
 nearest = min(abs(scroll - target) for target in targets)
 if nearest > 2.0:
     raise SystemExit(f"scroll {scroll:.2f} is {nearest:.2f} from column snaps {targets}")

@@ -95,14 +95,14 @@ Shortcut sets are versioned (`shortcut_set_version = 1`). On upgrade, keep the u
 
 ### 1.4 Trackpad gesture
 - Horizontal swipe with `swipe_fingers` fingers (default 4; allowed 3, 4, 5; 0 = off). `swipe_natural` (true) sets the direction.
-- The strip follows the fingers 1:1: Δ`scroll_x` = −Δ(mean normalized x of the touches) × trackpad-to-points factor `swipe_sensitivity` × viewport width (default 1.0).
+- The strip follows the fingers 1:1: Δ`scroll_x` = −Δ(mean normalized x of the touches) × trackpad-to-points factor `swipe_sensitivity` × viewport width (default 1.5).
 - On lift, fling with the release velocity, decelerating at `swipe_deceleration` (4.0/s), then snap with the spring to the column whose center is nearest the viewport center, and focus it.
 - Reversing direction mid-swipe keeps tracking. Past the first/last column, rubber-band (resistance 0.3, spring back).
 - Windows entering from off-screen are moved into place on the first gesture frame so they glide in with the strip.
 - Vertical swipes are ignored (macOS keeps them for Mission Control and App Exposé).
 
 ### 1.5 Visuals
-- **Animation:** one spring for all strip motion. `animation_duration_ms` (500; 0 = instant) and `animation_damping` (0.9; 1.0 = no overshoot). Ticks are locked to the strip display's refresh rate. The first frame is written within the same event-loop turn as the keypress.
+- **Animation:** one spring for all strip motion. `animation_duration_ms` (250; 0 = instant) and `animation_damping` (0.9; 1.0 = no overshoot). Ticks are locked to the strip display's refresh rate. The first frame is written within the same event-loop turn as the keypress.
 - **Strip indicator:**
   - A frosted, borderless, non-activating panel centered horizontally, 12 pt above the visible frame's bottom edge, on the display of the strip.
   - One 40 pt tile per column with the app icon; a stacked/tabbed column shows its first window's icon plus a small count badge. The focused tile is highlighted; pinned tiles show a pin glyph at their edge.
@@ -132,13 +132,13 @@ center_focused_column = "never"   # never | on_overflow | always
 keep_original_height = false
 
 [animation]
-animation_duration_ms = 500
+animation_duration_ms = 250
 animation_damping = 0.9
 
 [swipe]
 swipe_fingers = 4        # 0 | 3 | 4 | 5
 swipe_natural = true
-swipe_sensitivity = 1.0
+swipe_sensitivity = 1.5
 swipe_deceleration = 4.0
 
 [focus]

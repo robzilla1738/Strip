@@ -27,7 +27,7 @@ struct OnboardingView: View {
     private var pageTitle: String {
         switch page {
         case 0: return model.appName.isEmpty ? "Welcome" : "Welcome to \(model.appName)"
-        case 1: return "Accessibility"
+        case 1: return ControlAccess.paneName
         case 2: return "Mac Setup"
         case 3: return "Tour"
         default: return "Ready"
@@ -39,10 +39,12 @@ struct OnboardingView: View {
         case 0:
             Text("Columns sit on a horizontal strip. Shortcuts and a trackpad swipe move between them.")
         case 1:
-            Text(model.axTrusted == true ? "Accessibility is granted." : "Grant Accessibility, then this page updates.")
+            Text(model.axTrusted == true
+                ? "\(ControlAccess.paneName) is granted."
+                : "Allow this app in Privacy & Security → \(ControlAccess.paneName). This page updates when macOS grants it.")
             if model.axTrusted != true {
-                Button("Open Accessibility") {
-                    NSWorkspace.shared.open(URL(string: FixLink.accessibility)!)
+                Button("Open \(ControlAccess.paneName)") {
+                    ControlAccess.openSettings()
                 }
             }
         case 2:

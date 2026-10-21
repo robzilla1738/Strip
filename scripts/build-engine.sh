@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Build strip-engine and strip, then copy them into the app bundle when Xcode
 # provides one. Debug uses the host target. Release uses aarch64-apple-darwin.
+# Both bundle an optimized engine: an unoptimized one cannot keep up with
+# 120 Hz animation, and the e2e checks build their own debug engine.
 set -euo pipefail
 source "$(dirname "$0")/lib.sh"
 root="$(strip_root)"
@@ -14,8 +16,8 @@ if [[ "$config" == "Release" ]]; then
   cargo build --release --target aarch64-apple-darwin -p strip-engine -p strip-cli
   bin="$root/engine/target/aarch64-apple-darwin/release"
 else
-  cargo build -p strip-engine -p strip-cli
-  bin="$root/engine/target/debug"
+  cargo build --release -p strip-engine -p strip-cli
+  bin="$root/engine/target/release"
 fi
 
 if [[ -n "${BUILT_PRODUCTS_DIR:-}" && -n "${FULL_PRODUCT_NAME:-}" ]]; then

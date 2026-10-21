@@ -18,7 +18,7 @@ pub fn raise_focused<H: FocusHost + ?Sized>(host: &mut H, window: u64, pid: i32)
 
 /// Production host. `AXRaise` + `AXFrontmost`, else the SkyLight front-process calls.
 pub struct AxHost<'a> {
-    pub api: &'a mut crate::ax::AxApi,
+    pub api: &'a crate::ax::AxApi,
 }
 
 impl FocusHost for AxHost<'_> {

@@ -3,10 +3,8 @@
 use std::collections::{HashMap, HashSet};
 use std::os::raw::{c_int, c_void};
 use std::ptr;
-use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
-use std::sync::{Mutex, Once, OnceLock};
-
-use block::ConcreteBlock;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
 
 use crate::hotkeys;
 use crate::metrics::percentile;
@@ -203,35 +201,8 @@ extern "C" {
 }
 
 fn wake_main_loop() {
-    let run_loop = hotkeys::main_loop();
-    if run_loop.is_null() {
-        return;
-    }
-    unsafe {
-        let block = tick_block();
-        if !block.is_null() {
-            CFRunLoopPerformBlock(run_loop, kCFRunLoopDefaultMode, block);
-        }
-        CFRunLoopWakeUp(run_loop);
-    }
+    hotkeys::wake_main();
 }
-
-fn tick_block() -> *const c_void {
-    static ONCE: Once = Once::new();
-    static PTR: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
-    ONCE.call_once(|| {
-        let block = ConcreteBlock::new(|| {
-            TICKS.fetch_add(1, Ordering::Relaxed);
-        })
-        .copy();
-        let ptr = &*block as *const _ as *const c_void;
-        PTR.store(ptr as *mut c_void, Ordering::SeqCst);
-        std::mem::forget(block);
-    });
-    PTR.load(Ordering::SeqCst)
-}
-
-static TICKS: AtomicU64 = AtomicU64::new(0);
 
 #[link(name = "CoreVideo", kind = "framework")]
 extern "C" {
@@ -250,11 +221,4 @@ extern "C" {
 #[link(name = "CoreGraphics", kind = "framework")]
 extern "C" {
     fn CGMainDisplayID() -> u32;
-}
-
-#[link(name = "CoreFoundation", kind = "framework")]
-extern "C" {
-    static kCFRunLoopDefaultMode: *const c_void;
-    fn CFRunLoopPerformBlock(run_loop: *mut c_void, mode: *const c_void, block: *const c_void);
-    fn CFRunLoopWakeUp(run_loop: *mut c_void);
 }

@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, RwLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -80,7 +80,9 @@ struct WorkerState {
 }
 
 struct Shared<A> {
-    api: Mutex<A>,
+    /// Writers share read access so one slow app does not hold up the others.
+    /// Element resolution on the main thread takes the write side.
+    api: RwLock<A>,
     guard: Mutex<EnhancedGuard>,
     metrics: Mutex<Metrics>,
     commits: AtomicU64,
@@ -106,7 +108,7 @@ impl<A: WindowApi + 'static> WriterPool<A> {
     pub fn new(api: A, clock: Arc<dyn Clock>) -> Self {
         Self {
             shared: Arc::new(Shared {
-                api: Mutex::new(api),
+                api: RwLock::new(api),
                 guard: Mutex::new(EnhancedGuard::default()),
                 metrics: Mutex::new(Metrics::default()),
                 commits: AtomicU64::new(0),
@@ -164,8 +166,8 @@ impl<A: WindowApi + 'static> WriterPool<A> {
 
     pub fn poll_enhanced_ui(&self) {
         let now = self.shared.clock.now();
-        let mut api = lock(&self.shared.api);
-        lock(&self.shared.guard).restore_due(&mut *api, now);
+        let api = self.shared.api.read().unwrap_or_else(|err| err.into_inner());
+        lock(&self.shared.guard).restore_due(&*api, now);
     }
 
     pub fn commits(&self) -> u64 {
@@ -185,8 +187,13 @@ impl<A: WindowApi + 'static> WriterPool<A> {
     }
 
     pub fn with_api<R>(&self, body: impl FnOnce(&mut A) -> R) -> R {
-        let mut api = lock(&self.shared.api);
+        let mut api = self.shared.api.write().unwrap_or_else(|err| err.into_inner());
         body(&mut api)
+    }
+
+    pub fn with_api_ref<R>(&self, body: impl FnOnce(&A) -> R) -> R {
+        let api = self.shared.api.read().unwrap_or_else(|err| err.into_inner());
+        body(&api)
     }
 
     /// Drain sizes stored after two identical AX misses.
@@ -345,16 +352,18 @@ fn apply_one<A: WindowApi>(
 ) {
     let started = Instant::now();
     let read_back = {
-        let mut api = lock(&shared.api);
-        let now = shared.clock.now();
-        lock(&shared.guard).before_write(&mut *api, pid, now);
-        if write_size {
-            write_resize_move(&mut *api, window, frame);
+        let api = shared.api.read().unwrap_or_else(|err| err.into_inner());
+        lock(&shared.guard).before_write(&*api, pid, shared.clock.now());
+        let read_back = if write_size {
+            write_resize_move(&*api, window, frame);
+            api.read_frame(window)
         } else {
+            // A read-back per animation frame doubles the AX traffic. Position
+            // ticks keep the size of the last structural write.
             api.write_position(window, frame.x, frame.y);
-        }
-        let read_back = api.read_frame(window);
-        lock(&shared.guard).before_write(&mut *api, pid, shared.clock.now());
+            frame
+        };
+        lock(&shared.guard).note_write(pid, shared.clock.now());
         read_back
     };
     lock(&shared.read_backs).insert(window, read_back);
@@ -387,11 +396,11 @@ mod tests {
     mock! {
         pub Api {}
         impl WindowApi for Api {
-            fn write_size(&mut self, window: u64, width: f64, height: f64);
-            fn write_position(&mut self, window: u64, x: f64, y: f64);
-            fn read_frame(&mut self, window: u64) -> Frame;
-            fn enhanced_ui(&mut self, pid: i32) -> bool;
-            fn set_enhanced_ui(&mut self, pid: i32, enabled: bool);
+            fn write_size(&self, window: u64, width: f64, height: f64);
+            fn write_position(&self, window: u64, x: f64, y: f64);
+            fn read_frame(&self, window: u64) -> Frame;
+            fn enhanced_ui(&self, pid: i32) -> bool;
+            fn set_enhanced_ui(&self, pid: i32, enabled: bool);
         }
     }
 

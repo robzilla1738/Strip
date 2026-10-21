@@ -168,3 +168,112 @@ extension WireLine {
         return action
     }
 }
+
+extension JSONValue {
+    /// Mirrors the Codable decoder: integral numbers become `.int`, the rest `.double`.
+    init?(foundation raw: Any) {
+        switch raw {
+        case is NSNull:
+            self = .null
+        case let value as String:
+            self = .string(value)
+        case let number as NSNumber:
+            if CFGetTypeID(number) == CFBooleanGetTypeID() {
+                self = .bool(number.boolValue)
+            } else if let value = exactInt(number) {
+                self = .int(value)
+            } else {
+                self = .double(number.doubleValue)
+            }
+        case let values as [Any]:
+            var items: [JSONValue] = []
+            items.reserveCapacity(values.count)
+            for value in values {
+                guard let item = JSONValue(foundation: value) else { return nil }
+                items.append(item)
+            }
+            self = .array(items)
+        case let fields as [String: Any]:
+            var object: [String: JSONValue] = [:]
+            object.reserveCapacity(fields.count)
+            for (key, value) in fields {
+                guard let item = JSONValue(foundation: value) else { return nil }
+                object[key] = item
+            }
+            self = .object(object)
+        default:
+            return nil
+        }
+    }
+}
+
+private func exactInt(_ number: NSNumber) -> Int? {
+    guard CFNumberIsFloatType(number) else { return number.intValue }
+    let value = number.doubleValue
+    guard value.rounded() == value, value >= -9.2e18, value <= 9.2e18 else { return nil }
+    return Int(value)
+}
+
+extension WireLine {
+    /// JSONSerialization-backed equivalent of `JSONDecoder().decode(WireLine.self, from:)`.
+    /// Returns nil wherever the Codable path would throw.
+    static func parse(_ data: Data) -> WireLine? {
+        guard let raw = try? JSONSerialization.jsonObject(with: data),
+              let fields = raw as? [String: Any] else { return nil }
+        return try? WireLine(fields: fields)
+    }
+
+    private struct Mismatch: Error {}
+
+    private init(fields: [String: Any]) throws {
+        func field<T>(_ key: String, _ convert: (Any) -> T?) throws -> T? {
+            guard let raw = fields[key], !(raw is NSNull) else { return nil }
+            guard let value = convert(raw) else { throw Mismatch() }
+            return value
+        }
+        guard let type = fields["type"] as? String else { throw Mismatch() }
+        self.type = type
+        id = try field("id", unsigned)
+        client = try field("client") { $0 as? String }
+        protocolVersion = try field("protocol") { unsigned($0).flatMap { UInt32(exactly: $0) } }
+        action = try field("action") { $0 as? String }
+        args = try field("args") { JSONValue(foundation: $0) }
+        what = try field("what") { $0 as? String }
+        events = try field("events") { raw in
+            guard let values = raw as? [Any] else { return nil }
+            let strings = values.compactMap { $0 as? String }
+            return strings.count == values.count ? strings : nil
+        }
+        enabled = try field("enabled", boolean)
+        engineVersion = try field("engine_version") { $0 as? String }
+        axTrusted = try field("ax_trusted", boolean)
+        privateAPI = try field("private_api") { raw in
+            guard let flags = raw as? [String: Any],
+                  let skylight = flags["skylight"].flatMap(boolean),
+                  let axGetWindow = flags["ax_get_window"].flatMap(boolean) else { return nil }
+            return PrivateFlags(skylight: skylight, axGetWindow: axGetWindow)
+        }
+        ok = try field("ok", boolean)
+        data = try field("data") { JSONValue(foundation: $0) }
+        error = try field("error") { raw in
+            guard let body = raw as? [String: Any],
+                  let code = body["code"] as? String,
+                  let message = body["message"] as? String else { return nil }
+            return ErrorBody(code: code, message: message)
+        }
+        event = try field("event") { $0 as? String }
+    }
+}
+
+private func boolean(_ raw: Any) -> Bool? {
+    guard let number = raw as? NSNumber, CFGetTypeID(number) == CFBooleanGetTypeID() else { return nil }
+    return number.boolValue
+}
+
+private func unsigned(_ raw: Any) -> UInt64? {
+    guard let number = raw as? NSNumber, CFGetTypeID(number) != CFBooleanGetTypeID() else { return nil }
+    if CFNumberIsFloatType(number) {
+        return UInt64(exactly: number.doubleValue)
+    }
+    return number.int64Value >= 0 ? number.uint64Value : nil
+}

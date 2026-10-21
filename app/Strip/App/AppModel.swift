@@ -24,6 +24,12 @@ final class AppModel: ObservableObject {
     private var adoptedEngine = false
     private var pendingCommand: URLCommand?
     private let clientLock = NSLock()
+    private var trustTimer: Timer?
+    private var restartedForTrust = false
+    private var connecting = false
+    private let eventLock = NSLock()
+    private var pendingEvents: [WireLine] = []
+    private var drainScheduled = false
 
     func launch() {
         let env = ProcessInfo.processInfo.environment
@@ -43,11 +49,15 @@ final class AppModel: ObservableObject {
         let settings = SettingsModel(url: paths.config)
         settings.onChange = { [weak self] document in
             document.applyRuntimeSideEffects()
-            self?.overlays.setShowIndicator(document.showIndicator)
+            self?.overlays.applyAppearance(document)
         }
-        overlays.setShowIndicator(settings.document.showIndicator)
+        overlays.applyAppearance(settings.document)
         if !adoptedEngine {
             settings.document.applyRuntimeSideEffects()
+        }
+        if !AXIsProcessTrusted() {
+            ControlAccess.prompt()
+            watchForTrust()
         }
         overlays.onFocus = { [weak self] id in
             self?.send("focus_window", .object(["window_id": .int(Int(id))]))
@@ -71,7 +81,10 @@ final class AppModel: ObservableObject {
             log: paths.log
         )
         supervisor.onChange = { [weak self] in
-            DispatchQueue.main.async { self?.refresh() }
+            DispatchQueue.main.async {
+                self?.refresh()
+                self?.reconnectIfNeeded()
+            }
         }
         if !adoptedEngine {
             supervisor.start()
@@ -195,12 +208,30 @@ final class AppModel: ObservableObject {
         supervisor.forceTerminate()
     }
 
+    /// The event tap is created at engine start. After the user grants access,
+    /// start the engine again so the tap is created with the new permission.
+    private func watchForTrust() {
+        trustTimer?.invalidate()
+        trustTimer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] timer in
+            guard let self, !self.didShutdown else {
+                timer.invalidate()
+                return
+            }
+            guard AXIsProcessTrusted() else { return }
+            timer.invalidate()
+            self.trustTimer = nil
+            guard self.axTrusted != true, !self.restartedForTrust else { return }
+            self.restartedForTrust = true
+            self.restartEngine()
+        }
+    }
+
     func refresh() {
         running = adoptedEngine || supervisor.currentPID() != nil
         if supervisor.gaveUp {
             statusLine = "Engine stopped — Reveal Log / Restart"
         } else if axTrusted == false {
-            statusLine = "Needs Accessibility"
+            statusLine = "Needs \(ControlAccess.paneName)"
             accessibilityLine = "Not granted"
         } else if running && managing {
             statusLine = "Running"
@@ -211,6 +242,18 @@ final class AppModel: ObservableObject {
     }
 
     private func connect(to path: String) {
+        clientLock.lock()
+        if connecting {
+            clientLock.unlock()
+            return
+        }
+        connecting = true
+        clientLock.unlock()
+        defer {
+            clientLock.lock()
+            connecting = false
+            clientLock.unlock()
+        }
         let deadline = Date().addingTimeInterval(5)
         var hello: WireLine?
         let client = IpcClient()
@@ -222,27 +265,34 @@ final class AppModel: ObservableObject {
             Thread.sleep(forTimeInterval: 0.1)
         }
         guard let hello, let trusted = hello.axTrusted else {
+            client.close()
             DispatchQueue.main.async { self.refresh() }
             return
         }
         clientLock.lock()
+        let previousClient = self.client
         self.client = client
         clientLock.unlock()
+        previousClient?.close()
         let events = IpcClient()
-        if (try? events.open(socketPath: path, client: "app")) != nil {
-            events.onEvent = { [weak self] line in
-                DispatchQueue.main.async {
-                    guard let self else { return }
-                    self.overlays.apply(event: line)
-                    if let action = line.tourAction {
-                        self.tour.receive(action)
-                    }
-                }
+        events.onEvent = { [weak self] line in
+            self?.enqueue(line)
+        }
+        events.onClose = { [weak self, weak events] _ in
+            DispatchQueue.main.async {
+                guard let self, let events else { return }
+                self.eventStreamEnded(events, path: path)
             }
+        }
+        if (try? events.open(socketPath: path, client: "app")) != nil {
             _ = try? events.subscribe(["state", "focus", "indicator", "tour", "log"])
             clientLock.lock()
+            let previousEvents = self.events
             self.events = events
             clientLock.unlock()
+            previousEvents?.close()
+        } else {
+            events.close()
         }
         if AXIsProcessTrusted() && !trusted {
             AgentFallback.register(bundleID: Brand.current.bundleID)
@@ -255,6 +305,64 @@ final class AppModel: ObservableObject {
             if let enabled = self.licenseWantsManaging {
                 self.applyLicenseManaging(enabled)
             }
+        }
+    }
+
+    /// State lines can arrive at display refresh rate. Only the newest of a run of
+    /// consecutive states is worth applying; other events keep their order.
+    private func enqueue(_ line: WireLine) {
+        eventLock.lock()
+        if line.event == "state", let last = pendingEvents.last, last.event == "state" {
+            pendingEvents[pendingEvents.count - 1] = line
+        } else {
+            pendingEvents.append(line)
+        }
+        let schedule = !drainScheduled
+        drainScheduled = true
+        eventLock.unlock()
+        if schedule {
+            DispatchQueue.main.async { [weak self] in self?.drainEvents() }
+        }
+    }
+
+    private func drainEvents() {
+        eventLock.lock()
+        let batch = pendingEvents
+        pendingEvents.removeAll(keepingCapacity: true)
+        drainScheduled = false
+        eventLock.unlock()
+        for line in batch {
+            overlays.apply(event: line)
+            if let action = line.tourAction {
+                tour.receive(action)
+            }
+        }
+    }
+
+    private func eventStreamEnded(_ stream: IpcClient, path: String) {
+        clientLock.lock()
+        let current = events === stream
+        if current { events = nil }
+        clientLock.unlock()
+        guard current else { return }
+        overlays.reset()
+        refresh()
+        guard !didShutdown else { return }
+        DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + 0.5) { [weak self] in
+            guard let self, !self.didShutdown else { return }
+            self.connect(to: path)
+        }
+    }
+
+    /// The supervisor respawns a crashed engine on its own; follow it to the new socket.
+    private func reconnectIfNeeded() {
+        guard !didShutdown, supervisor.currentPID() != nil, let path = paths?.socket.path else { return }
+        clientLock.lock()
+        let attached = events != nil || connecting
+        clientLock.unlock()
+        guard !attached else { return }
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            self?.connect(to: path)
         }
     }
 
