@@ -33,8 +33,42 @@ struct Cli {
     validate_config: Option<PathBuf>,
 }
 
+fn apply_default_paths(cli: &mut Cli) {
+    let name = match std::env::var("STRIP_APP_NAME") {
+        Ok(name) if !name.is_empty() && !name.contains('{') => name,
+        Ok(name) if name.contains('{') => {
+            eprintln!("MISSING: {{{{APP_NAME}}}}");
+            return;
+        }
+        _ => return,
+    };
+    let Ok(home) = std::env::var("HOME") else {
+        return;
+    };
+    let support = PathBuf::from(&home).join("Library").join("Application Support").join(&name);
+    let logs = PathBuf::from(home).join("Library").join("Logs").join(name);
+    if cli.socket.is_none() {
+        cli.socket = Some(support.join("engine.sock"));
+    }
+    if cli.config.is_none() {
+        cli.config = Some(support.join("config.toml"));
+    }
+    if cli.state.is_none() {
+        cli.state = Some(support.join("state.json"));
+    }
+    if cli.log.is_none() {
+        cli.log = Some(logs.join("engine.log"));
+    }
+}
+
+fn ensure_parent(path: &Option<PathBuf>) {
+    if let Some(parent) = path.as_ref().and_then(|item| item.parent()) {
+        let _ = std::fs::create_dir_all(parent);
+    }
+}
+
 fn main() -> ExitCode {
-    let cli = Cli::parse();
+    let mut cli = Cli::parse();
     if let Some(path) = cli.validate_config.as_ref() {
         return match Config::load(path) {
             Ok(_) => ExitCode::SUCCESS,
@@ -44,6 +78,11 @@ fn main() -> ExitCode {
             }
         };
     }
+    apply_default_paths(&mut cli);
+    ensure_parent(&cli.socket);
+    ensure_parent(&cli.config);
+    ensure_parent(&cli.state);
+    ensure_parent(&cli.log);
 
     let private_api = PrivateApi::live();
     eprintln!(
@@ -51,14 +90,14 @@ fn main() -> ExitCode {
         private_api.skylight, private_api.ax_get_window, private_api.slps
     );
     let config = match cli.config.as_ref() {
-        Some(path) => match Config::load(path) {
+        Some(path) if path.is_file() => match Config::load(path) {
             Ok(config) => config,
             Err(err) => {
                 eprintln!("{err}");
                 return ExitCode::from(1);
             }
         },
-        None => Config::default(),
+        _ => Config::default(),
     };
     let snapshot = Arc::new(Mutex::new("{}".to_string()));
     let metrics = Arc::new(Mutex::new("{}".to_string()));

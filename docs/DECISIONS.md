@@ -14,6 +14,8 @@ Paneru at `98781431b09ebe44ef226b766ca2e82fddad9728` is vendored unmodified at `
 
 The Swift app talks to the engine with `Network.framework` `NWConnection` over a Unix-domain endpoint (`app/Strip/Engine/IpcClient.swift`). Line framing matches the Rust codec.
 
+A nil `transportProtocol` fails on this OS (`nw_endpoint_handler_set_protocol_instance called with null protocol_parameters`). `NWParameters(tls: nil, tcp:)` — the same stack as `NWParameters.tcp` — reaches `.ready` on `NWEndpoint.unix` and exchanges the engine hello as a raw byte stream. No TCP header was observed on the line. TCP options set `noDelay` so a command line is not delayed.
+
 ## Product strings
 
 User-visible name, bundle id, and URL scheme come from `config/brand.env` through the generated xcconfig and Info.plist (`$(STRIP_APP_NAME)`, `$(STRIP_URL_SCHEME)`, `$(STRIP_BUNDLE_ID)`). The fixed binary names `strip-engine` and `strip` are the Section 2.1 process names, not the product name.
@@ -81,6 +83,30 @@ The on-screen list keeps Core Graphics window levels 0 through 8. Level 0 is a n
 `state.json` is the query snapshot written on each tick and on exit. Launch matches windows for 10 seconds with `restore::match_windows`: `(CGWindowID, pid)` first, then a unique `(bundle, title, role, subrole)`. An ambiguous title matches nothing. Restored columns keep their saved width and are placed without a spring.
 
 Wake and unlock notifications set a flag. The main thread, and `strip debug simulate_wake`, wait 1.5 seconds, re-read the active Space, re-enumerate windows, and re-apply frames with the springs snapped. The existing event tap is enabled again. A second tap is not created, because it would swallow each key twice. Strips stay keyed by display UUID. The Space id from SkyLight is stored on the session. When SkyLight is missing, `fallback_space_key` is the hash used for that id.
+
+## App private symbols
+
+`app/Strip/App/PrivateAPI.swift` is the only Swift call site of `dlsym`. The app's checks use public APIs: Accessibility, preferences, IOKit, and `NSScreen`. No private symbol is required, so the startup check's required list is empty and nothing is missing. SkyLight and `_AXUIElementGetWindow` stay in the engine's `private_api` module.
+
+## LaunchAgent paths
+
+When `--socket`, `--config`, `--state`, or `--log` is omitted, the engine fills the path from `STRIP_APP_NAME` under Application Support and Logs. The generated agent plist sets that variable from the brand xcconfig. A placeholder name prints `MISSING: {{APP_NAME}}` and leaves the flags unset. A missing config file loads defaults so the first launch still comes up.
+
+## Unset trial length
+
+An unset `TRIAL_DAYS` prints `MISSING: {{TRIAL_DAYS}}` and is stored as an empty build setting. The license state machine treats that empty value as license required, the same runtime state as `0`. It is not written into `config/release.env`.
+
+## Headless owner filter
+
+`--headless-test` sets `STRIP_ONLY_OWNER` when the parent environment did not. The supervised engine started by that test does not move unrelated windows. A normal launch does not set the variable.
+
+## CLI filename on case-insensitive volumes
+
+Section 2.1 places the Rust CLI at `Contents/MacOS/strip` next to the app executable `Contents/MacOS/{{APP_NAME}}`. With `APP_NAME=Strip` those paths are the same directory entry on the default case-insensitive APFS volume, and copying the CLI replaces the app. The bundle stores that binary at `Contents/MacOS/strip-cli`. Install Command Line Tool symlinks `strip-cli` to `/usr/local/bin/strip` when `strip` is not a distinct file. A brand whose name does not collide still copies the CLI to `Contents/MacOS/strip`.
+
+## Xcode target name
+
+The Xcode project, scheme, and `app/Strip` directory keep the Section 2.2 names so `xcodebuild -scheme Strip` matches the spec. User-visible strings, the bundle id, and the URL scheme still come from `config/brand.env`.
 
 ## Definition-of-done search roots
 
