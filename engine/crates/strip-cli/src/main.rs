@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
+use strip_ipc::{encode, ClientMessage, ServerMessage};
 
 #[derive(Parser)]
 #[command(name = "strip", version, about = "Scrolling window manager commands")]
@@ -18,11 +19,6 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Run an action id from the shortcut table.
-    Run {
-        action: String,
-        n: Option<u32>,
-    },
     Query {
         what: String,
         #[arg(long)]
@@ -32,44 +28,63 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// An action id, then an optional 1-based index.
+    #[command(external_subcommand)]
+    Action(Vec<String>),
 }
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
-    let mut stream = match UnixStream::connect(&cli.socket) {
+    let stream = match UnixStream::connect(&cli.socket) {
         Ok(stream) => stream,
         Err(err) => {
             eprintln!("socket: {err}");
             return ExitCode::from(1);
         }
     };
-    if exchange(&mut stream, &serde_json::json!({"id": 1, "type": "hello", "client": "cli", "protocol": 1})).is_err() {
+    let mut write = match stream.try_clone() {
+        Ok(write) => write,
+        Err(err) => {
+            eprintln!("{err}");
+            return ExitCode::from(1);
+        }
+    };
+    let mut reader = BufReader::new(stream);
+    if send(&mut write, &ClientMessage::Hello { id: 1, client: "cli".to_string(), protocol: 1 }).is_err() {
         return ExitCode::from(1);
     }
-    let request = match cli.command {
-        Command::Query { what, json: _ } => serde_json::json!({"id": 2, "type": "query", "what": what}),
-        Command::Run { action, n } => {
-            let mut args = serde_json::Map::new();
-            if let Some(n) = n {
-                args.insert("n".to_string(), serde_json::json!(n));
+    if read_message(&mut reader).is_err() {
+        return ExitCode::from(1);
+    }
+    match cli.command {
+        Command::Query { what, json: _ } => one_shot(&mut write, &mut reader, &ClientMessage::Query { id: 2, what }, true),
+        Command::Subscribe { json: _ } => subscribe(&mut write, &mut reader),
+        Command::Action(args) => {
+            let Some(action) = args.first() else {
+                eprintln!("missing action");
+                return ExitCode::from(1);
+            };
+            let mut body = serde_json::Map::new();
+            if let Some(n) = args.get(1).and_then(|text| text.parse::<u64>().ok()) {
+                body.insert("n".to_string(), serde_json::json!(n));
             }
-            serde_json::json!({"id": 2, "type": "command", "action": action, "args": args})
+            one_shot(
+                &mut write,
+                &mut reader,
+                &ClientMessage::Command { id: 2, action: action.clone(), args: serde_json::Value::Object(body) },
+                false,
+            )
         }
-        Command::Subscribe { json: _ } => serde_json::json!({"id": 2, "type": "subscribe", "events": ["state", "focus", "indicator", "tour", "log"]}),
-    };
-    match exchange(&mut stream, &request) {
-        Ok(response) => {
-            if let Some(data) = response.get("data") {
-                println!("{data}");
-            } else {
-                println!("{response}");
-            }
-            if response.get("ok").and_then(|value| value.as_bool()) == Some(false) {
-                ExitCode::from(1)
-            } else {
-                ExitCode::SUCCESS
-            }
-        }
+    }
+}
+
+fn one_shot(write: &mut UnixStream, reader: &mut BufReader<UnixStream>, message: &ClientMessage, data_only: bool) -> ExitCode {
+    if let Err(err) = send(write, message) {
+        eprintln!("{err}");
+        return ExitCode::from(1);
+    }
+    match read_message(reader) {
+        Ok(response) => print_response(&response, data_only),
         Err(err) => {
             eprintln!("{err}");
             ExitCode::from(1)
@@ -77,12 +92,60 @@ fn main() -> ExitCode {
     }
 }
 
-fn exchange(stream: &mut UnixStream, request: &serde_json::Value) -> Result<serde_json::Value, String> {
-    let mut line = serde_json::to_string(request).map_err(|err| err.to_string())?;
-    line.push('\n');
-    stream.write_all(line.as_bytes()).map_err(|err| err.to_string())?;
-    let mut reader = BufReader::new(stream.try_clone().map_err(|err| err.to_string())?);
-    let mut response = String::new();
-    reader.read_line(&mut response).map_err(|err| err.to_string())?;
-    serde_json::from_str(response.trim()).map_err(|err| err.to_string())
+fn subscribe(write: &mut UnixStream, reader: &mut BufReader<UnixStream>) -> ExitCode {
+    let message = ClientMessage::Subscribe {
+        id: 2,
+        events: ["state", "focus", "indicator", "tour", "log"].into_iter().map(str::to_string).collect(),
+    };
+    if let Err(err) = send(write, &message) {
+        eprintln!("{err}");
+        return ExitCode::from(1);
+    }
+    let mut stdout = std::io::stdout().lock();
+    loop {
+        let mut line = String::new();
+        match reader.read_line(&mut line) {
+            Ok(0) => return ExitCode::SUCCESS,
+            Ok(_) => {
+                if write!(stdout, "{line}").is_err() || stdout.flush().is_err() {
+                    return ExitCode::from(1);
+                }
+            }
+            Err(err) => {
+                eprintln!("{err}");
+                return ExitCode::from(1);
+            }
+        }
+    }
+}
+
+fn print_response(response: &ServerMessage, data_only: bool) -> ExitCode {
+    let failed = matches!(response, ServerMessage::Result { ok: false, .. });
+    if data_only {
+        if let ServerMessage::Result { data: Some(data), .. } = response {
+            println!("{data}");
+        } else {
+            println!("{}", serde_json::to_string(response).unwrap_or_else(|_| "{}".to_string()));
+        }
+    } else {
+        println!("{}", serde_json::to_string(response).unwrap_or_else(|_| "{}".to_string()));
+    }
+    if failed {
+        ExitCode::from(1)
+    } else {
+        ExitCode::SUCCESS
+    }
+}
+
+fn send(write: &mut UnixStream, message: &ClientMessage) -> Result<(), String> {
+    write.write_all(encode(message).as_bytes()).map_err(|err| err.to_string())
+}
+
+fn read_message(reader: &mut BufReader<UnixStream>) -> Result<ServerMessage, String> {
+    let mut line = String::new();
+    let read = reader.read_line(&mut line).map_err(|err| err.to_string())?;
+    if read == 0 {
+        return Err("socket closed".to_string());
+    }
+    serde_json::from_str(line.trim()).map_err(|err| err.to_string())
 }

@@ -1,4 +1,4 @@
-//! Line-delimited JSON on a Unix socket. Queries read the latest snapshot.
+//! Line-delimited JSON on a Unix socket. Commands are applied on the main thread.
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::PermissionsExt;
@@ -7,9 +7,20 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::thread;
 
+use strip_ipc::{decode_client, encode, ClientMessage, ServerMessage, MAX_LINE_BYTES};
+
+use crate::bus::Bus;
 use crate::private_api::PrivateApi;
 
-pub fn listen(path: &Path, state: Arc<Mutex<String>>, private_api: PrivateApi, ax_trusted: bool) -> std::io::Result<()> {
+pub struct Serve {
+    pub state: Arc<Mutex<String>>,
+    pub metrics: Arc<Mutex<String>>,
+    pub private_api: PrivateApi,
+    pub ax_trusted: bool,
+    pub bus: Arc<Bus>,
+}
+
+pub fn listen(path: &Path, serve: Serve) -> std::io::Result<()> {
     if path.exists() {
         let _ = std::fs::remove_file(path);
     }
@@ -23,56 +34,119 @@ pub fn listen(path: &Path, state: Arc<Mutex<String>>, private_api: PrivateApi, a
             let Ok(stream) = incoming else {
                 continue;
             };
-            let state = Arc::clone(&state);
-            let private_api = private_api.clone();
+            let serve = Serve {
+                state: Arc::clone(&serve.state),
+                metrics: Arc::clone(&serve.metrics),
+                private_api: serve.private_api.clone(),
+                ax_trusted: serve.ax_trusted,
+                bus: Arc::clone(&serve.bus),
+            };
             thread::spawn(move || {
-                let _ = handle(stream, &state, &private_api, ax_trusted);
+                let _ = handle(stream, &serve);
             });
         }
     });
     Ok(())
 }
 
-fn handle(stream: UnixStream, state: &Mutex<String>, private_api: &PrivateApi, ax_trusted: bool) -> std::io::Result<()> {
+fn handle(stream: UnixStream, serve: &Serve) -> std::io::Result<()> {
     let mut write = stream.try_clone()?;
-    let reader = BufReader::new(stream);
-    for line in reader.lines() {
-        let line = line?;
-        let request: serde_json::Value = serde_json::from_str(&line).unwrap_or(serde_json::json!({}));
-        let id = request.get("id").and_then(|value| value.as_u64()).unwrap_or(0);
-        let kind = request.get("type").and_then(|value| value.as_str()).unwrap_or("");
-        let response = match kind {
-            "hello" => serde_json::json!({
-                "id": id,
-                "type": "hello",
-                "protocol": 1,
-                "engine_version": strip_core::ENGINE_VERSION,
-                "ax_trusted": ax_trusted,
-                "private_api": {
-                    "skylight": private_api.skylight,
-                    "ax_get_window": private_api.ax_get_window,
-                },
-            }),
-            "query" => {
-                let what = request.get("what").and_then(|value| value.as_str()).unwrap_or("");
-                if what == "state" {
-                    let data: serde_json::Value = serde_json::from_str(&state.lock().unwrap_or_else(|err| err.into_inner()))
-                        .unwrap_or(serde_json::json!({}));
-                    serde_json::json!({"id": id, "type": "result", "ok": true, "data": data})
-                } else {
-                    serde_json::json!({"id": id, "type": "result", "ok": false, "error": {"code": "bad_request", "message": "unknown query"}})
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    loop {
+        line.clear();
+        let read = reader.read_line(&mut line)?;
+        if read == 0 {
+            break;
+        }
+        if line.len() > MAX_LINE_BYTES {
+            write_message(&mut write, &ServerMessage::error(0, "bad_request", "line exceeds 1 MiB"))?;
+            break;
+        }
+        let message = match decode_client(line.trim()) {
+            Ok(message) => message,
+            Err(_) => {
+                write_message(&mut write, &ServerMessage::error(0, "bad_request", "malformed json"))?;
+                continue;
+            }
+        };
+        match message {
+            ClientMessage::Hello { id, .. } => {
+                write_message(
+                    &mut write,
+                    &ServerMessage::hello(
+                        id,
+                        strip_core::ENGINE_VERSION,
+                        serve.ax_trusted,
+                        serve.private_api.skylight,
+                        serve.private_api.ax_get_window,
+                    ),
+                )?;
+            }
+            ClientMessage::Query { id, what } => write_message(&mut write, &query(serve, id, &what))?,
+            ClientMessage::Subscribe { id, events } => {
+                write_message(&mut write, &ServerMessage::ok(id))?;
+                let (sub_id, events_rx) = serve.bus.subscribe(events);
+                let mut event_write = write.try_clone()?;
+                thread::spawn(move || {
+                    while let Ok(event) = events_rx.recv() {
+                        if writeln!(event_write, "{event}").is_err() {
+                            break;
+                        }
+                    }
+                });
+                // Stay on this connection until the client closes it.
+                let mut rest = String::new();
+                loop {
+                    rest.clear();
+                    if reader.read_line(&mut rest)? == 0 {
+                        break;
+                    }
+                }
+                serve.bus.unsubscribe(sub_id);
+                break;
+            }
+            other => {
+                let id = message_id(&other);
+                let rx = serve.bus.post(other);
+                match rx.recv() {
+                    Ok(response) => writeln!(write, "{response}")?,
+                    Err(_) => write_message(&mut write, &ServerMessage::error(id, "internal", "engine stopped"))?,
                 }
             }
-            "shutdown" => {
-                crate::lifecycle::request_stop();
-                serde_json::json!({"id": id, "type": "result", "ok": true})
-            }
-            _ => serde_json::json!({"id": id, "type": "result", "ok": false, "error": {"code": "bad_request", "message": "unsupported"}}),
-        };
-        writeln!(write, "{response}")?;
-        if kind == "shutdown" {
-            break;
         }
     }
     Ok(())
+}
+
+fn query(serve: &Serve, id: u64, what: &str) -> ServerMessage {
+    let state = serve.state.lock().unwrap_or_else(|err| err.into_inner()).clone();
+    let parsed: serde_json::Value = serde_json::from_str(&state).unwrap_or(serde_json::json!({}));
+    match what {
+        "state" => ServerMessage::data(id, parsed),
+        "displays" => ServerMessage::data(id, parsed.get("displays").cloned().unwrap_or(serde_json::json!([]))),
+        "metrics" => {
+            let body = serve.metrics.lock().unwrap_or_else(|err| err.into_inner()).clone();
+            let data = serde_json::from_str(&body).unwrap_or(serde_json::json!({}));
+            ServerMessage::data(id, data)
+        }
+        "config_errors" => ServerMessage::data(id, serde_json::json!([])),
+        _ => ServerMessage::error(id, "bad_request", "unknown query"),
+    }
+}
+
+fn message_id(message: &ClientMessage) -> u64 {
+    match message {
+        ClientMessage::Hello { id, .. }
+        | ClientMessage::Command { id, .. }
+        | ClientMessage::Query { id, .. }
+        | ClientMessage::Subscribe { id, .. }
+        | ClientMessage::ReloadConfig { id }
+        | ClientMessage::SetManaging { id, .. }
+        | ClientMessage::Shutdown { id } => *id,
+    }
+}
+
+fn write_message(write: &mut UnixStream, message: &ServerMessage) -> std::io::Result<()> {
+    write.write_all(encode(message).as_bytes())
 }

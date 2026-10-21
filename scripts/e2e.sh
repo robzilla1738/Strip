@@ -17,6 +17,10 @@ DUMP="$WORK/dump-frames"
 TESTAPP="$WORK/TestWindows"
 
 cleanup() {
+  if [[ -n "${SUB_PID:-}" ]] && kill -0 "$SUB_PID" 2>/dev/null; then
+    kill "$SUB_PID" 2>/dev/null || true
+    wait "$SUB_PID" 2>/dev/null || true
+  fi
   if [[ -n "${ENGINE_PID:-}" ]] && kill -0 "$ENGINE_PID" 2>/dev/null; then
     kill -TERM "$ENGINE_PID" 2>/dev/null || true
     wait "$ENGINE_PID" 2>/dev/null || true
@@ -74,7 +78,7 @@ query() {
 managed=0
 for _ in $(seq 1 40); do
   if body="$(query 2>/dev/null)"; then
-    managed="$(printf '%s' "$body" | jq '[.displays[].strips[].columns[].windows[]] | length')"
+    managed="$(printf '%s' "$body" | jq '[.displays[]?.strips[]?.columns[]?.windows[]] | length' 2>/dev/null || echo 0)"
     if [[ "$managed" -ge 6 ]]; then
       break
     fi
@@ -130,6 +134,41 @@ if len(frames) >= 6 and len(frames) * expected > vw + 1 and parked < 1:
 print("off-viewport windows expose ≤5×5 pt")
 PY
 
+"$CLI" --socket "$SOCKET" focus_index 3
+query | jq -e '[.displays[].strips[].focused_column] | any(. == 2)' >/dev/null
+echo "focus_index 3 -> column 2"
+
+"$CLI" --socket "$SOCKET" query state --json >/dev/null
+"$CLI" --socket "$SOCKET" subscribe --json >"$WORK/sub.json" &
+SUB_PID=$!
+sleep 0.2
+python3 - "$CLI" "$SOCKET" "$WORK/sub.json" <<'PY'
+import pathlib, subprocess, sys, time
+cli, socket, path = sys.argv[1:]
+log = pathlib.Path(path)
+before = len(log.read_text()) if log.exists() else 0
+start = time.perf_counter()
+subprocess.run([cli, "--socket", socket, "focus_right"], check=True)
+deadline = start + 0.1
+while time.perf_counter() < deadline:
+    text = log.read_text() if log.exists() else ""
+    fresh = text[before:]
+    if '"event":"focus"' in fresh or '"event": "focus"' in fresh:
+        print(f"focus event in {(time.perf_counter() - start) * 1000:.0f} ms")
+        raise SystemExit(0)
+    time.sleep(0.002)
+text = log.read_text() if log.exists() else ""
+raise SystemExit(f"no focus event within 100 ms\n{text[before:]}")
+PY
+
+if "$CLI" --socket "$SOCKET" not_a_command >"$WORK/unknown.json" 2>"$WORK/unknown.err"; then
+  echo "unknown action should fail"
+  cat "$WORK/unknown.json"
+  exit 1
+fi
+grep -q unknown_action "$WORK/unknown.json"
+echo "unknown_action"
+
 kill -TERM "$ENGINE_PID"
 wait "$ENGINE_PID" || true
 ENGINE_PID=""
@@ -151,3 +190,4 @@ print("unparked")
 PY
 
 echo "e2e step 4 ok"
+echo "e2e step 5 ok"

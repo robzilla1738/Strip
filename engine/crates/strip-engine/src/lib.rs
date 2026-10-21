@@ -1,4 +1,5 @@
 pub mod ax;
+pub mod bus;
 pub mod bindings;
 pub mod config;
 pub mod enhanced_ui;

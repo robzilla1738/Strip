@@ -58,6 +58,10 @@ The SIGTERM and SIGINT handler only sets an atomic and writes one byte to a self
 
 `ax.rs` allows `deprecated` and `unexpected_cfgs`. The `cocoa` 0.26 API is itself deprecated and emits those warnings. SkyLight and `_AXUIElementGetWindow` stay behind `dlsym` in `private_api`.
 
+## Command thread
+
+IPC `hello`, `query`, and `subscribe` run on the connection thread. `command`, `set_managing`, `reload_config`, and `shutdown` are posted to a condvar mailbox and applied on the main thread before the result line is written. A focus action emits a `focus` event even when the column index does not change. `toggle_float` and `send_next_display` are known actions and return `ok` without changing the model until the step 9 behaviours land, so a later tick cannot disagree with a float flag that does not exist yet.
+
 ## Definition-of-done search roots
 
 `scripts/dod.sh` searches shipped sources (`engine/crates`, `app`, `tools`, `integrations`, `scripts`). It does not flag `TODO` comments inside the unmodified `engine/upstream` snapshot.

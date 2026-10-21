@@ -852,12 +852,17 @@ dependencies = [
  "serde",
  "serde_json",
  "strip-core",
+ "strip-ipc",
  "toml",
 ]
 
 [[package]]
 name = "strip-ipc"
 version = "1.0.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
 
 [[package]]
 name = "strsim"
