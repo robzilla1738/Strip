@@ -136,6 +136,40 @@ impl WindowApi for AxApi {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct Traits {
+    pub role: String,
+    pub subrole: String,
+    pub size_settable: bool,
+    pub fixed_size: bool,
+    pub fullscreen: bool,
+}
+
+impl Default for Traits {
+    fn default() -> Self {
+        Self {
+            role: String::new(),
+            subrole: String::new(),
+            size_settable: true,
+            fixed_size: false,
+            fullscreen: false,
+        }
+    }
+}
+
+impl AxApi {
+    pub fn describe(&self, id: u64) -> Traits {
+        let Some(element) = self.windows.get(&id).map(|element| element.0) else {
+            return Traits::default();
+        };
+        unsafe { read_traits(element) }
+    }
+}
+
+pub fn warp_cursor(x: f64, y: f64) {
+    unsafe { CGWarpMouseCursorPosition(CgPoint { x, y }) };
+}
+
 impl Drop for AxApi {
     fn drop(&mut self) {
         for element in self.windows.values().chain(self.apps.values()) {
@@ -243,7 +277,9 @@ pub fn on_screen_windows() -> Vec<ListedWindow> {
                 continue;
             }
             let layer = dict_f64(dict, "kCGWindowLayer");
-            if layer > 0.0 {
+            // 0 is a normal window. 3 and 8 are floating and modal panels (dialogs).
+            // Higher levels are menus and status items.
+            if layer < 0.0 || layer > 8.0 {
                 continue;
             }
             let id = dict_f64(dict, "kCGWindowNumber") as u64;
@@ -304,15 +340,20 @@ fn match_element(api: &AxApi, element: *mut c_void, group: &[&ListedWindow]) -> 
         }
     }
     let frame = unsafe { read_frame(element) };
-    group
-        .iter()
-        .find(|window| {
-            (window.bounds.x - frame.x).abs() < 8.0
-                && (window.bounds.y - frame.y).abs() < 8.0
-                && (window.bounds.width - frame.width).abs() < 8.0
-                && (window.bounds.height - frame.height).abs() < 8.0
-        })
-        .map(|window| window.id)
+    if let Some(window) = group.iter().find(|window| {
+        (window.bounds.x - frame.x).abs() < 8.0
+            && (window.bounds.y - frame.y).abs() < 8.0
+            && (window.bounds.width - frame.width).abs() < 8.0
+            && (window.bounds.height - frame.height).abs() < 8.0
+    }) {
+        return Some(window.id);
+    }
+    let title = unsafe { copy_string(element, "AXTitle") };
+    if title.is_empty() {
+        return None;
+    }
+    let matched: Vec<u64> = group.iter().filter(|window| window.title == title).map(|window| window.id).collect();
+    if matched.len() == 1 { Some(matched[0]) } else { None }
 }
 
 fn app_element(pid: i32) -> Option<*mut c_void> {
@@ -393,6 +434,43 @@ unsafe fn read_size(element: *mut c_void, name: &str) -> CgSize {
         cf_release(value);
     }
     size
+}
+
+unsafe fn read_traits(element: *mut c_void) -> Traits {
+    let role = copy_string(element, "AXRole");
+    let subrole = copy_string(element, "AXSubrole");
+    let size_settable = attribute_settable(element, "AXSize").unwrap_or(true);
+    let min = read_size(element, "AXMinSize");
+    let max = read_size(element, "AXMaxSize");
+    let fixed_size = min.width > 1.0
+        && min.height > 1.0
+        && (min.width - max.width).abs() <= 2.0
+        && (min.height - max.height).abs() <= 2.0;
+    Traits {
+        role,
+        subrole,
+        size_settable,
+        fixed_size,
+        fullscreen: copy_bool(element, "AXFullScreen"),
+    }
+}
+
+unsafe fn attribute_settable(element: *mut c_void, name: &str) -> Option<bool> {
+    let key = cf_string(name);
+    let mut settable = 1u8;
+    let err = AXUIElementIsAttributeSettable(element, key, &mut settable);
+    cf_release(key);
+    if err != 0 { None } else { Some(settable != 0) }
+}
+
+unsafe fn copy_string(element: *mut c_void, name: &str) -> String {
+    let mut value = std::ptr::null();
+    if copy_attr(element, name, &mut value) != 0 || value.is_null() {
+        return String::new();
+    }
+    let text = cf_string_copy(value);
+    cf_release(value);
+    text
 }
 
 unsafe fn copy_bool(element: *mut c_void, name: &str) -> bool {
@@ -575,6 +653,8 @@ extern "C" {
     fn AXUIElementCopyAttributeValue(element: *mut c_void, attribute: *const c_void, value: *mut *const c_void) -> i32;
     fn AXUIElementSetAttributeValue(element: *mut c_void, attribute: *const c_void, value: *const c_void) -> i32;
     fn AXUIElementSetMessagingTimeout(element: *mut c_void, timeout: f32) -> i32;
+    fn AXUIElementIsAttributeSettable(element: *mut c_void, attribute: *const c_void, settable: *mut u8) -> i32;
+    fn CGWarpMouseCursorPosition(point: CgPoint) -> i32;
     fn AXValueCreate(kind: u32, value: *const c_void) -> *const c_void;
     fn AXValueGetValue(value: *mut c_void, kind: u32, out: *mut c_void) -> u8;
     fn CGWindowListCopyWindowInfo(option: u32, relative: u32) -> *const c_void;

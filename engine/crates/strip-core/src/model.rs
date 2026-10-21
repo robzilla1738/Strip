@@ -153,6 +153,21 @@ impl Strip {
         self.reveal(params, visible);
     }
 
+    /// Rebuild a saved column without scrolling. `index` is clamped to the end.
+    pub fn insert_at(&mut self, window: Window, index: usize, width_ratio: f64) {
+        if self.contains(window.id) {
+            return;
+        }
+        let index = index.min(self.columns.len());
+        let column = Column::single(self.alloc_column(), window, width_ratio);
+        self.columns.insert(index, column);
+        if let Focus::Column(focus) = self.focus {
+            if index <= focus {
+                self.focus = Focus::Column(focus + 1);
+            }
+        }
+    }
+
     pub fn remove(&mut self, id: WindowId, params: &LayoutParams, visible: Viewport) {
         if self.take_from_pin(true, id) || self.take_from_pin(false, id) {
             self.reveal(params, visible);

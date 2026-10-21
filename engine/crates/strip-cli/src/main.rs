@@ -53,6 +53,8 @@ enum DebugHook {
         #[arg(long)]
         phase: String,
     },
+    #[command(name = "simulate_wake")]
+    SimulateWake,
 }
 
 fn main() -> ExitCode {
@@ -83,12 +85,16 @@ fn main() -> ExitCode {
         Command::Subscribe { json: _ } => subscribe(&mut write, &mut reader),
         #[cfg(feature = "debug-hooks")]
         Command::Debug { hook } => {
-            let DebugHook::InjectGesture { fingers, dx, dy, phase } = hook;
-            let args = serde_json::json!({ "fingers": fingers, "dx": dx, "dy": dy, "phase": phase });
+            let (action, args) = match hook {
+                DebugHook::InjectGesture { fingers, dx, dy, phase } => {
+                    ("inject_gesture", serde_json::json!({ "fingers": fingers, "dx": dx, "dy": dy, "phase": phase }))
+                }
+                DebugHook::SimulateWake => ("simulate_wake", serde_json::json!({})),
+            };
             one_shot(
                 &mut write,
                 &mut reader,
-                &ClientMessage::Command { id: 2, action: "inject_gesture".to_string(), args },
+                &ClientMessage::Command { id: 2, action: action.to_string(), args },
                 false,
             )
         }

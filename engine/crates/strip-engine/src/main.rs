@@ -15,6 +15,7 @@ use strip_engine::lifecycle;
 use strip_engine::private_api::PrivateApi;
 use strip_engine::serve::{self, Serve};
 use strip_engine::session::Runtime;
+use strip_engine::wake;
 
 #[derive(Parser)]
 #[command(name = "strip-engine", version, about = "Scrolling window engine")]
@@ -79,7 +80,16 @@ fn main() -> ExitCode {
     let _wakeup = lifecycle::install(Arc::new(|| {
         lifecycle::request_stop();
     }));
-    let mut runtime = Runtime::start(config, cli.config.clone(), &private_api, Arc::clone(&snapshot), Arc::clone(&metrics), trusted);
+    let mut runtime = Runtime::start(
+        config,
+        cli.config.clone(),
+        cli.state.clone(),
+        &private_api,
+        Arc::clone(&snapshot),
+        Arc::clone(&metrics),
+        trusted,
+    );
+    wake::install();
     let tap = hotkeys::install();
     hotkeys::remember_main_loop();
     runtime.tick();
@@ -91,9 +101,12 @@ fn main() -> ExitCode {
             write_state(&cli, &snapshot);
             break;
         }
+        if wake::take_request() {
+            runtime.resync_after_wake();
+        }
         // The tap callback runs on this thread while the run loop is pumping.
         // Idle waits are long; IPC, the tap, and the display link wake this thread.
-        let slice = if runtime.is_animating() { 0.02 } else { 0.25 };
+        let slice = if runtime.is_animating() { 0.02 } else { 1.0 };
         hotkeys::pump(&mut runtime, &bus, slice);
         runtime.drain_frames();
         let _ = tap.as_ref().map(hotkeys::EventTap::alive);

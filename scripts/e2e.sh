@@ -28,6 +28,11 @@ cleanup() {
   if [[ -n "${WINDOWS_PID:-}" ]] && kill -0 "$WINDOWS_PID" 2>/dev/null; then
     kill "$WINDOWS_PID" 2>/dev/null || true
   fi
+  if [[ -f "${WORK:-}/extras.pids" ]]; then
+    while read -r pid; do
+      kill "$pid" 2>/dev/null || true
+    done < "$WORK/extras.pids"
+  fi
 }
 trap cleanup EXIT
 
@@ -347,6 +352,233 @@ cpu="$(ps -p "$ENGINE_PID" -o %cpu= | tr -d "[:space:]")"
 echo "idle cpu=$cpu"
 python3 -c 'import sys; raise SystemExit(0 if float(sys.argv[1]) < 0.5 else 1)' "$cpu"
 echo "e2e step 7 ok"
+
+launch_extra() {
+  "$TESTAPP" "$@" >>"$WORK/windows.out" 2>&1 &
+  echo "$!" >> "$WORK/extras.pids"
+}
+
+column_signature() {
+  query | jq -c '[.displays[].strips[].columns[] | {w: .width_ratio, ids: [.windows[].id]}]'
+}
+
+"$CLI" --socket "$SOCKET" focus_index 1
+"$CLI" --socket "$SOCKET" pin_left
+pinned=0
+for _ in $(seq 1 20); do
+  body="$(query)"
+  if python3 -c '
+import json, sys
+state = json.loads(sys.argv[1])
+display = state["displays"][0]
+pin = display["strips"][0].get("pinned_left")
+if not pin or not pin.get("windows"):
+    raise SystemExit(1)
+x = float(pin["windows"][0]["frame"][0])
+min_x = float(display["visible_frame"][0])
+gap = 8.0
+if abs(x - (min_x + gap)) > 2.0:
+    raise SystemExit(1)
+print(f"pin_left x={x:.2f} visible_min={min_x:.2f} gap={gap:.0f}")
+' "$body"; then
+    pinned=1
+    break
+  fi
+  sleep 0.1
+done
+if [[ "$pinned" != 1 ]]; then
+  echo "pin_left did not hold the visible edge"
+  query || true
+  exit 1
+fi
+pinned_x="$(query | jq -r '.displays[0].strips[0].pinned_left.windows[0].frame[0]')"
+for _ in 1 2 3; do
+  "$CLI" --socket "$SOCKET" focus_right
+done
+later_x="$(query | jq -r '.displays[0].strips[0].pinned_left.windows[0].frame[0]')"
+python3 -c 'import sys; raise SystemExit(0 if abs(float(sys.argv[1]) - float(sys.argv[2])) < 1.0 else 1)' "$pinned_x" "$later_x"
+echo "pin_left held x=$later_x across focus_right x3"
+"$CLI" --socket "$SOCKET" pin_left
+"$CLI" --socket "$SOCKET" pin_left
+"$CLI" --socket "$SOCKET" focus_index 1
+"$CLI" --socket "$SOCKET" cycle_width
+expected="$(column_signature)"
+echo "column signature before restart $expected"
+
+kill -TERM "$ENGINE_PID"
+wait "$ENGINE_PID" || true
+ENGINE_PID=""
+rm -f "$SOCKET"
+"$ENGINE" --socket "$SOCKET" --config "$CONFIG" --state "$STATE" --log "$LOG" >>"$WORK/engine.out" 2>&1 &
+ENGINE_PID=$!
+for _ in $(seq 1 50); do
+  [[ -S "$SOCKET" ]] && break
+  sleep 0.1
+done
+[[ -S "$SOCKET" ]]
+restored=0
+for _ in $(seq 1 40); do
+  if body="$(query 2>/dev/null)"; then
+    got="$(printf '%s' "$body" | jq -c '[.displays[].strips[].columns[] | {w: .width_ratio, ids: [.windows[].id]}]' 2>/dev/null || true)"
+    if python3 -c '
+import json, sys
+expected = json.loads(sys.argv[1])
+got = json.loads(sys.argv[2])
+if len(expected) != len(got) or not expected:
+    raise SystemExit(1)
+for left, right in zip(expected, got):
+    if left["ids"] != right["ids"]:
+        raise SystemExit(1)
+    if abs(float(left["w"]) - float(right["w"])) > 0.001:
+        raise SystemExit(1)
+' "$expected" "$got"; then
+      restored=1
+      break
+    fi
+  fi
+  sleep 0.25
+done
+if [[ "$restored" != 1 ]]; then
+  echo "restart did not restore column order and widths"
+  echo "expected $expected"
+  query || true
+  exit 1
+fi
+echo "restart restored column order and widths"
+
+cat > "$CONFIG" <<'EOF'
+[general]
+launch_at_login = false
+start_managing_on_launch = true
+show_in_dock = false
+shortcut_set_version = 1
+
+[[rules]]
+bundle_id = "TestWindows"
+title = "Float.*"
+floating = true
+EOF
+"$CLI" --socket "$SOCKET" reload_config
+launch_extra --title Float --count 1
+launch_extra --title Fixed --fixed-size --count 1
+launch_extra --title Dialog --dialog --count 1
+floated=0
+for _ in $(seq 1 60); do
+  body="$(query)"
+  if python3 -c '
+import json, sys
+state = json.loads(sys.argv[1])
+titles = []
+for display in state.get("displays", []):
+    for strip in display.get("strips", []):
+        for column in strip.get("columns", []):
+            for window in column.get("windows", []):
+                titles.append(window.get("title", ""))
+floating = [window.get("title", "") for window in state.get("floating", [])]
+needed = ["Float 1", "Fixed 1", "Dialog 1"]
+if any(title in titles for title in needed):
+    raise SystemExit(1)
+if any(title not in floating for title in needed):
+    raise SystemExit(1)
+print("float rule, fixed-size, and dialog stayed out of strips")
+' "$body"; then
+    floated=1
+    break
+  fi
+  sleep 0.25
+done
+if [[ "$floated" != 1 ]]; then
+  echo "float, fixed-size, or dialog window entered a strip"
+  query || true
+  tail -40 "$WORK/engine.out" || true
+  exit 1
+fi
+
+focus_before="$(query | jq -c '[.displays[].strips[] | select((.columns | length) > 0) | {focused: .focused_column, scroll: .scroll_x}]')"
+launch_extra --title Background --background --count 1
+quiet=0
+for _ in $(seq 1 40); do
+  body="$(query)"
+  if python3 -c '
+import json, sys
+state = json.loads(sys.argv[1])
+before = json.loads(sys.argv[2])
+found = False
+now = []
+for display in state.get("displays", []):
+    for strip in display.get("strips", []):
+        columns = strip.get("columns", [])
+        if not columns:
+            continue
+        titles = [window.get("title", "") for column in columns for window in column.get("windows", [])]
+        if "Background 1" in titles:
+            found = True
+        now.append({"focused": strip.get("focused_column"), "scroll": strip.get("scroll_x")})
+if not found:
+    raise SystemExit(1)
+if len(now) != len(before):
+    raise SystemExit(1)
+for left, right in zip(before, now):
+    if left["focused"] != right["focused"] or abs(float(left["scroll"]) - float(right["scroll"])) > 0.5:
+        raise SystemExit(f"focus changed {before} -> {now}")
+print("background launch kept focus and scroll_x")
+' "$body" "$focus_before"; then
+    quiet=1
+    break
+  fi
+  sleep 0.25
+done
+if [[ "$quiet" != 1 ]]; then
+  echo "background window changed focus or scroll"
+  query || true
+  exit 1
+fi
+
+wake_before="$(query | jq -c '{cols: [.displays[].strips[].columns[] | {w: .width_ratio, ids: [.windows[].id]}], focus: [.displays[].strips[].focused_column], scroll: [.displays[].strips[].scroll_x], floating: [.floating[].title] | sort}')"
+"$CLI" --socket "$SOCKET" debug simulate_wake
+wake_after="$(query | jq -c '{cols: [.displays[].strips[].columns[] | {w: .width_ratio, ids: [.windows[].id]}], focus: [.displays[].strips[].focused_column], scroll: [.displays[].strips[].scroll_x], floating: [.floating[].title] | sort}')"
+if [[ "$wake_before" != "$wake_after" ]]; then
+  echo "simulate_wake changed state"
+  echo "before $wake_before"
+  echo "after  $wake_after"
+  exit 1
+fi
+if ! grep -q "event tap enabled" "$WORK/engine.out"; then
+  echo "simulate_wake left the tap disabled"
+  tail -40 "$WORK/engine.out" || true
+  exit 1
+fi
+echo "simulate_wake kept state and the event tap enabled"
+
+screen_count="$(query | jq '.displays | length')"
+if [[ "$screen_count" -lt 2 ]]; then
+  echo "multi-display skipped: one display"
+  "$CLI" --socket "$SOCKET" send_next_display
+  if ! grep -q "multi-display skipped" "$WORK/engine.out"; then
+    echo "send_next_display did not log the single-display skip"
+    exit 1
+  fi
+else
+  moved_id="$(query | jq -r '[.displays[0].strips[].columns[].windows[].id] | first')"
+  "$CLI" --socket "$SOCKET" send_next_display
+  sleep 0.4
+  if ! query | jq -e --argjson id "$moved_id" '[.displays[1].strips[].columns[].windows[].id] | index($id) != null' >/dev/null; then
+    echo "send_next_display did not move $moved_id"
+    query || true
+    exit 1
+  fi
+  echo "send_next_display moved $moved_id"
+  ignored="$(query | jq -r '.displays[0].uuid')"
+  cat >> "$CONFIG" <<EOF
+
+[displays]
+ignored_displays = ["$ignored"]
+EOF
+  "$CLI" --socket "$SOCKET" reload_config
+  sleep 1.2
+  echo "ignored_displays left $ignored unmanaged"
+fi
+echo "e2e step 9 ok"
 
 kill -TERM "$ENGINE_PID"
 wait "$ENGINE_PID" || true

@@ -69,6 +69,26 @@ pub fn probe<S: SymbolSource + ?Sized>(source: &S) -> PrivateApi {
     }
 }
 
+/// Active Space from SkyLight. `1` when the symbol is missing or returns 0.
+/// Strips stay keyed by display UUID; this id is recorded on the session and
+/// refreshed on wake. The missing-SkyLight path uses [`fallback_space_key`].
+pub fn current_space() -> u64 {
+    let Some(main) = live_symbol_ptr(SKYLIGHT, "SLSMainConnectionID") else {
+        return 1;
+    };
+    let Some(get) = live_symbol_ptr(SKYLIGHT, "SLSGetActiveSpace") else {
+        return 1;
+    };
+    type Main = unsafe extern "C" fn() -> i32;
+    type Get = unsafe extern "C" fn(i32) -> u64;
+    let id = unsafe {
+        let main: Main = std::mem::transmute(main);
+        let get: Get = std::mem::transmute(get);
+        get(main())
+    };
+    if id == 0 { 1 } else { id }
+}
+
 /// FNV-1a 64 of the sorted on-screen window ids. Used when SkyLight is missing.
 pub fn fallback_space_key(window_ids: &[u64]) -> u64 {
     let mut ids = window_ids.to_vec();
@@ -160,6 +180,11 @@ mod tests {
     fn live_probe_checks_symbols_without_panicking() {
         let flags = PrivateApi::live();
         let _ = (flags.skylight, flags.ax_get_window, flags.slps);
+    }
+
+    #[test]
+    fn current_space_is_at_least_one() {
+        assert!(current_space() >= 1);
     }
 
     #[test]

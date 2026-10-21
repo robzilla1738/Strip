@@ -61,6 +61,18 @@ impl EventTap {
     }
 }
 
+/// Re-enable the tap created at startup. A second tap would swallow each key twice.
+pub fn enable_tap() -> bool {
+    let port = TAP_PORT.with(|cell| cell.get());
+    if port.is_null() {
+        eprintln!("event tap unavailable");
+        return false;
+    }
+    unsafe { CGEventTapEnable(port, 1) };
+    eprintln!("event tap enabled");
+    true
+}
+
 pub fn install() -> Option<EventTap> {
     let mask = event_mask();
     let port = unsafe {
@@ -124,6 +136,11 @@ extern "C" fn tap_callback(
         swipe::observe(runtime, event_type, event);
         return event;
     }
+    if matches!(event_type, 1 | 2 | 5 | 6) {
+        let point = unsafe { CGEventGetLocation(event) };
+        runtime.note_pointer(event_type, point.x, point.y);
+        return event;
+    }
     if event_type == FLAGS_CHANGED {
         emit_hold(runtime, bus, event);
         return event;
@@ -180,6 +197,13 @@ extern "C" {
     fn CGEventTapEnable(tap: *mut c_void, enable: u8);
     fn CGEventGetIntegerValueField(event: *mut c_void, field: u32) -> i64;
     fn CGEventGetFlags(event: *mut c_void) -> u64;
+    fn CGEventGetLocation(event: *mut c_void) -> CgPoint;
+}
+
+#[repr(C)]
+struct CgPoint {
+    x: f64,
+    y: f64,
 }
 
 #[link(name = "CoreFoundation", kind = "framework")]

@@ -363,6 +363,61 @@ pub fn first_rule<'a>(
     })
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Placement {
+    Manage { slot: Option<u32> },
+    Float,
+    Fullscreen,
+}
+
+pub struct AdmitWindow<'a> {
+    pub bundle_id: &'a str,
+    pub title: &'a str,
+    pub role: &'a str,
+    pub subrole: &'a str,
+    pub size_settable: bool,
+    pub fixed_size: bool,
+    pub fullscreen: bool,
+    pub own_process: bool,
+}
+
+/// Rules that force floating win first. Dialogs, fixed-size windows, Quick Look,
+/// and this process float even without a rule. A slot rule applies only when
+/// the window would otherwise be managed.
+pub fn admit(rules: &[Rule], window: AdmitWindow<'_>) -> Placement {
+    if window.fullscreen {
+        return Placement::Fullscreen;
+    }
+    if let Some(rule) = first_rule(rules, window.bundle_id, window.title, window.role, window.subrole) {
+        if rule.floating {
+            return Placement::Float;
+        }
+    }
+    if window.own_process || is_quicklook(window.bundle_id) {
+        return Placement::Float;
+    }
+    if !window.subrole.is_empty() && window.subrole != "AXStandardWindow" {
+        return Placement::Float;
+    }
+    if !window.size_settable || window.fixed_size {
+        return Placement::Float;
+    }
+    if let Some(rule) = first_rule(rules, window.bundle_id, window.title, window.role, window.subrole) {
+        if let Some(slot) = rule.slot {
+            return Placement::Manage { slot: Some(slot) };
+        }
+    }
+    Placement::Manage { slot: None }
+}
+
+pub fn shown_bundle(bundle_id: &str, owner: &str) -> String {
+    if bundle_id.is_empty() { owner.to_string() } else { bundle_id.to_string() }
+}
+
+fn is_quicklook(bundle: &str) -> bool {
+    bundle.to_ascii_lowercase().starts_with("com.apple.quicklook") || bundle.starts_with("com.apple.QuickLookUIFramework")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -413,6 +468,57 @@ mod tests {
     fn unknown_fields_are_accepted() {
         let text = format!("{SECTION_1_6_EXAMPLE}\n[future]\nextra = true\n");
         assert!(Config::parse(&text).is_ok());
+    }
+
+    fn sample<'a>(title: &'a str, subrole: &'a str) -> AdmitWindow<'a> {
+        AdmitWindow {
+            bundle_id: "TestWindows",
+            title,
+            role: "AXWindow",
+            subrole,
+            size_settable: true,
+            fixed_size: false,
+            fullscreen: false,
+            own_process: false,
+        }
+    }
+
+    #[test]
+    fn standard_window_is_managed() {
+        let rules = Config::default().rules;
+        assert_eq!(admit(&rules, sample("Window 1", "AXStandardWindow")), Placement::Manage { slot: None });
+    }
+
+    #[test]
+    fn title_rule_floats_and_dialog_and_fixed_size_float() {
+        let rules = vec![Rule {
+            bundle_id: Some("TestWindows".to_string()),
+            title: Some("Float.*".to_string()),
+            role: None,
+            subrole: None,
+            floating: true,
+            slot: None,
+        }];
+        assert_eq!(admit(&rules, sample("Float 1", "AXStandardWindow")), Placement::Float);
+        assert_eq!(admit(&rules, sample("Window 1", "AXStandardWindow")), Placement::Manage { slot: None });
+        let mut dialog = sample("Dialog 1", "AXSystemDialog");
+        dialog.bundle_id = "TestWindows";
+        assert_eq!(admit(&rules, dialog), Placement::Float);
+        let mut fixed = sample("Fixed 1", "AXStandardWindow");
+        fixed.fixed_size = true;
+        assert_eq!(admit(&rules, fixed), Placement::Float);
+        let mut quick = sample("Preview", "AXStandardWindow");
+        quick.bundle_id = "com.apple.quicklook.QuickLookUIService";
+        assert_eq!(admit(&[], quick), Placement::Float);
+        let mut own = sample("Strip", "AXStandardWindow");
+        own.own_process = true;
+        assert_eq!(admit(&[], own), Placement::Float);
+    }
+
+    #[test]
+    fn owner_name_fills_an_empty_bundle_id() {
+        assert_eq!(shown_bundle("", "TestWindows"), "TestWindows");
+        assert_eq!(shown_bundle("local.app", "TestWindows"), "local.app");
     }
 
     #[test]

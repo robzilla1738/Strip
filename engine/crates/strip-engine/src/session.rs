@@ -5,13 +5,16 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use strip_core::{layout, CenterMode, DisplayFrame, DisplayMode, Focus, Frame, Gesture, LayoutParams, Spring, Strip, SwipeView, Viewport, Visibility, Window};
+use strip_core::{
+    layout, CenterMode, DisplayFrame, DisplayMode, Focus, Frame, Gesture, LayoutParams, Spring, Strip, SwipeView, Viewport, Visibility, Window, WindowId,
+};
 
-use crate::ax::{self, AxApi, DisplayInfo, ListedWindow};
-use crate::config::Config;
+use crate::ax::{self, AxApi, DisplayInfo, ListedWindow, Traits};
+use crate::config::{self, AdmitWindow, Config, Placement};
 use crate::display_link::DisplayDriver;
 use crate::parking::restored_frame;
 use crate::private_api::PrivateApi;
+use crate::restore::{self, SavedSession};
 use crate::writer::{Clock, SystemClock, WriterPool};
 
 pub struct Runtime {
@@ -31,6 +34,21 @@ pub struct Runtime {
     driver: DisplayDriver,
     animating: bool,
     gesture: Gesture,
+    saved: Option<SavedSession>,
+    restore_until: Instant,
+    restored_members: HashMap<(String, usize), Vec<u64>>,
+    scroll_applied: HashSet<String>,
+    floating: HashMap<u64, FloatingWindow>,
+    fullscreen: HashMap<u64, Departed>,
+    departed: HashMap<u64, Departed>,
+    settle: bool,
+    force_resolve: bool,
+    space_id: u64,
+    pointer_x: f64,
+    pointer_y: f64,
+    pointer_at: Instant,
+    pointer_seen: bool,
+    drag: Option<Drag>,
 }
 
 struct Motion {
@@ -78,18 +96,40 @@ impl Motion {
     }
 }
 
+#[derive(Clone)]
 struct Meta {
     pid: i32,
     bundle_id: String,
     title: String,
     owner: String,
     display: String,
+    role: String,
+    subrole: String,
+}
+
+struct FloatingWindow {
+    title: String,
+    pid: i32,
+    bundle_id: String,
+}
+
+struct Departed {
+    window: Window,
+    index: usize,
+    display: String,
+}
+
+struct Drag {
+    id: u64,
+    display: String,
+    column: usize,
 }
 
 impl Runtime {
     pub fn start(
         config: Config,
         config_path: Option<PathBuf>,
+        state_path: Option<PathBuf>,
         private_api: &PrivateApi,
         state: Arc<Mutex<String>>,
         metrics_body: Arc<Mutex<String>>,
@@ -97,6 +137,8 @@ impl Runtime {
     ) -> Self {
         ax::prepare_app();
         let only_owner = std::env::var("STRIP_ONLY_OWNER").ok().filter(|value| !value.is_empty());
+        let saved = state_path.as_ref().map(|path| restore::load_session(path)).filter(|session| !session.windows.is_empty());
+        let now = Instant::now();
         Self {
             config,
             pool: WriterPool::new(AxApi::new(private_api), Arc::new(SystemClock) as Arc<dyn Clock>),
@@ -114,6 +156,21 @@ impl Runtime {
             driver: DisplayDriver::new(),
             animating: false,
             gesture: Gesture::new(),
+            saved,
+            restore_until: now + Duration::from_secs(10),
+            restored_members: HashMap::new(),
+            scroll_applied: HashSet::new(),
+            floating: HashMap::new(),
+            fullscreen: HashMap::new(),
+            departed: HashMap::new(),
+            settle: false,
+            force_resolve: false,
+            space_id: crate::private_api::current_space(),
+            pointer_x: 0.0,
+            pointer_y: 0.0,
+            pointer_at: now,
+            pointer_seen: false,
+            drag: None,
         }
     }
 
@@ -185,39 +242,75 @@ impl Runtime {
         self.screens = displays.clone();
         let mut listed = self.eligible(&ax::on_screen_windows());
         listed.sort_by_key(|window| window.id);
-        self.pool.with_api(|api| ax::resolve_elements(api, &listed));
+        let need_resolve = self.force_resolve || listed.iter().any(|window| !self.meta.contains_key(&window.id) && !self.floating.contains_key(&window.id));
+        if need_resolve || self.saved.is_some() {
+            self.pool.with_api(|api| ax::resolve_elements(api, &listed));
+        }
+        let seen: HashSet<u64> = listed.iter().map(|window| window.id).collect();
+        self.floating.retain(|id, _| seen.contains(id));
+        let restoring = self.saved.as_ref().is_some_and(|saved| !saved.windows.is_empty()) && Instant::now() <= self.restore_until;
+        if restoring {
+            self.settle = true;
+            self.restore_arrived(&listed);
+        }
+        if Instant::now() > self.restore_until {
+            self.saved = None;
+        }
         let front = ax::frontmost_pid();
         let params = layout_params(&self.config);
-        let mut seen = HashSet::new();
+        let own_pid = std::process::id() as i32;
+        let mut fresh = Vec::new();
         for window in &listed {
-            seen.insert(window.id);
-            let Some(display) = display_for(&displays, window.bounds) else {
-                continue;
-            };
-            let strip = self.strips.entry(display.uuid.clone()).or_default();
-            if strip.contains(strip_core::WindowId(window.id)) {
+            if self.floating.contains_key(&window.id) || self.contains_id(window.id) {
                 continue;
             }
-            let mut model = Window::new(window.id, window.pid);
-            model.original_height = window.bounds.height;
-            let visible = viewport(&display.visible);
-            strip.insert(model, front, None, &params, visible);
-            self.meta.insert(
-                window.id,
-                Meta {
-                    pid: window.pid,
-                    bundle_id: ax::bundle_id(window.pid),
-                    title: window.title.clone(),
-                    owner: window.owner.clone(),
-                    display: display.uuid.clone(),
-                },
-            );
+            if self.ignored(window) {
+                self.detach(window.id, &params);
+                continue;
+            }
+            if let Some(departed) = self.departed.remove(&window.id) {
+                self.reinsert(window, departed, front, &params);
+                continue;
+            }
+            if let Some(saved) = self.fullscreen.get(&window.id).map(|item| Departed {
+                window: item.window.clone(),
+                index: item.index,
+                display: item.display.clone(),
+            }) {
+                let traits = self.pool.with_api(|api| api.describe(window.id));
+                if traits.fullscreen {
+                    continue;
+                }
+                self.fullscreen.remove(&window.id);
+                self.reinsert(window, saved, front, &params);
+                continue;
+            }
+            let traits = self.pool.with_api(|api| api.describe(window.id));
+            if traits.role.is_empty() && traits.subrole.is_empty() {
+                continue;
+            }
+            fresh.push((window.clone(), traits));
         }
+        self.adopt_fresh(fresh, front, own_pid, &params);
         self.remove_missing(&seen, &params);
+        self.focus_follows_pointer();
         self.publish_layouts(&displays, &params);
+        self.settle = false;
         self.pool.poll_enhanced_ui();
         self.publish_state(&self.screens);
         self.store_metrics();
+    }
+
+    /// Wait, re-enable the event tap, and re-apply the current strips without animation.
+    pub fn resync_after_wake(&mut self) {
+        std::thread::sleep(Duration::from_millis(1500));
+        let _ = crate::hotkeys::enable_tap();
+        self.space_id = crate::private_api::current_space();
+        self.settle = true;
+        self.force_resolve = true;
+        self.tick();
+        self.settle = false;
+        self.force_resolve = false;
     }
 
     pub fn binding_for(&self, binding: crate::bindings::Binding) -> Option<crate::bindings::ResolvedBinding> {
@@ -256,6 +349,11 @@ impl Runtime {
             self.apply_swipe(fingers, dx, dy, phase)?;
             return Ok(None);
         }
+        #[cfg(feature = "debug-hooks")]
+        if action == "simulate_wake" {
+            self.resync_after_wake();
+            return Ok(None);
+        }
         if !strip_ipc::is_known_action(action) {
             return Err(CommandError::UnknownAction);
         }
@@ -275,7 +373,14 @@ impl Runtime {
                 self.reload().map_err(CommandError::BadRequest)?;
                 return Ok(None);
             }
-            "toggle_float" | "send_next_display" => return Ok(None),
+            "toggle_float" => {
+                self.toggle_float()?;
+                return Ok(None);
+            }
+            "send_next_display" => {
+                self.send_next_display()?;
+                return Ok(None);
+            }
             _ => {}
         }
         let display = self.resolve_display(action, args)?;
@@ -293,7 +398,13 @@ impl Runtime {
         self.publish_layouts(&screens, &params);
         self.publish_state(&screens);
         if focus_action {
-            Ok(Some(self.focus_snap(&display)?))
+            let snap = self.focus_snap(&display)?;
+            if self.config.focus.mouse_follows_focus {
+                if let Some(frame) = self.last_on_screen.get(&snap.window_id).copied() {
+                    ax::warp_cursor(frame.x + frame.width / 2.0, frame.y + frame.height / 2.0);
+                }
+            }
+            Ok(Some(snap))
         } else {
             Ok(None)
         }
@@ -348,9 +459,14 @@ impl Runtime {
             .map(|(id, meta)| (meta.display.clone(), *id))
             .collect();
         for (display, id) in stale {
+            if let Some(strip) = self.strips.get(&display) {
+                if let Some((index, window)) = located(strip, id) {
+                    self.departed.insert(id, Departed { window, index, display: display.clone() });
+                }
+            }
             if let Some(strip) = self.strips.get_mut(&display) {
                 let visible = Viewport { x: 0.0, y: 0.0, width: 1.0, height: 1.0 };
-                strip.remove(strip_core::WindowId(id), params, visible);
+                strip.remove(WindowId(id), params, visible);
             }
             self.meta.remove(&id);
             self.last_on_screen.remove(&id);
@@ -409,7 +525,12 @@ impl Runtime {
         let body = serde_json::json!({
             "managing": self.managing,
             "displays": displays.iter().map(|display| self.display_json(display)).collect::<Vec<_>>(),
-            "floating": [],
+            "floating": self.floating.iter().map(|(id, info)| serde_json::json!({
+                "id": id,
+                "pid": info.pid,
+                "bundle_id": info.bundle_id,
+                "title": info.title,
+            })).collect::<Vec<_>>(),
         });
         if let Ok(text) = serde_json::to_string(&body) {
             *self.state.lock().unwrap_or_else(|err| err.into_inner()) = text;
@@ -430,14 +551,14 @@ impl Runtime {
             "name": display.name,
             "frame": frame_json(display.frame),
             "visible_frame": frame_json(display.visible),
-            "ignored": false,
-            "active_space": 1,
+            "ignored": self.config.displays.ignored_displays.iter().any(|id| id == &display.uuid),
+            "active_space": self.space_id,
             "strips": [{
-                "space": 1,
+                "space": self.space_id,
                 "scroll_x": strip.map(|strip| strip.scroll_x).unwrap_or(0.0),
                 "focused_column": focused,
-                "pinned_left": null,
-                "pinned_right": null,
+                "pinned_left": strip.map(|strip| pin_json(self, strip.pinned_left.as_ref())).unwrap_or(serde_json::Value::Null),
+                "pinned_right": strip.map(|strip| pin_json(self, strip.pinned_right.as_ref())).unwrap_or(serde_json::Value::Null),
                 "columns": columns,
             }],
         })
@@ -491,8 +612,21 @@ impl Runtime {
             "target": frame_json(frame),
             "visible": true,
             "height_ratio": window.height_ratio,
+            "role": meta.map(|meta| meta.role.clone()).unwrap_or_default(),
+            "subrole": meta.map(|meta| meta.subrole.clone()).unwrap_or_default(),
         })
     }
+}
+
+fn pin_json(runtime: &Runtime, pin: Option<&strip_core::Pinned>) -> serde_json::Value {
+    let Some(pin) = pin else {
+        return serde_json::Value::Null;
+    };
+    serde_json::json!({
+        "previous_index": pin.previous_index,
+        "width_ratio": pin.column.width_ratio,
+        "windows": pin.column.windows.iter().map(|window| runtime.window_json(window)).collect::<Vec<_>>(),
+    })
 }
 
 pub struct FocusSnap {
@@ -550,6 +684,10 @@ impl Runtime {
             let motion = self.motions.get_mut(&id).expect("motion");
             motion.pid = pid;
             motion.bundle_id = bundle.to_string();
+            if self.settle {
+                motion.snap(target);
+                Follow::Write(target)
+            } else {
             let size_delta = (motion.width - target.width).abs().max((motion.height - target.height).abs());
             let pos_delta = (motion.x.target - target.x).abs().max((motion.y.target - target.y).abs());
             if !animate || duration <= 0.0 {
@@ -591,6 +729,7 @@ impl Runtime {
                     motion.y.retarget(target.y);
                 }
                 Follow::Launch { sized, current: motion.rendered() }
+            }
             }
         };
         match action {
@@ -767,6 +906,482 @@ impl Runtime {
         };
         Ok(FocusSnap { window_id, display: display.to_string(), column })
     }
+}
+
+impl Runtime {
+    pub fn note_pointer(&mut self, kind: u32, x: f64, y: f64) {
+        self.pointer_x = x;
+        self.pointer_y = y;
+        self.pointer_at = Instant::now();
+        self.pointer_seen = true;
+        if !self.config.focus.drag_to_reorder {
+            return;
+        }
+        if kind == 1 {
+            if let Some((id, display, column, frame)) = self.window_under(x, y) {
+                if y <= frame.y + 28.0 {
+                    self.drag = Some(Drag { id, display, column });
+                }
+            }
+            return;
+        }
+        if kind != 2 {
+            return;
+        }
+        let Some(drag) = self.drag.take() else {
+            return;
+        };
+        let params = layout_params(&self.config);
+        let Some(target) = self.screen_at(x, y) else {
+            return;
+        };
+        if target != drag.display {
+            self.move_window_to_display(drag.id, &drag.display, &target, &params);
+            return;
+        }
+        let frames = self.column_spans(&drag.display);
+        let Some(dest) = restore::drop_index(&frames, x) else {
+            return;
+        };
+        let visible = self.viewport_of(&drag.display);
+        if let Some(strip) = self.strips.get_mut(&drag.display) {
+            let to = dest.min(strip.columns.len().saturating_sub(1));
+            strip.move_column(drag.column, to);
+            strip.reveal(&params, visible);
+        }
+        let screens = self.screens.clone();
+        self.publish_layouts(&screens, &params);
+        self.publish_state(&screens);
+    }
+
+    fn toggle_float(&mut self) -> Result<(), CommandError> {
+        if let Some(id) = self.args_window_floating() {
+            self.unfloat(id)?;
+            return Ok(());
+        }
+        let display = self.active_display().ok_or(CommandError::NoFocusedWindow)?;
+        let params = layout_params(&self.config);
+        let visible = self.viewport_of(&display);
+        let window = {
+            let strip = self.strips.get(&display).ok_or(CommandError::NoFocusedWindow)?;
+            focused_window(strip).cloned().ok_or(CommandError::NoFocusedWindow)?
+        };
+        let id = window.id.0;
+        let meta = self.meta.get(&id).cloned();
+        if let Some(strip) = self.strips.get_mut(&display) {
+            strip.remove(WindowId(id), &params, visible);
+        }
+        self.floating.insert(
+            id,
+            FloatingWindow {
+                title: meta.as_ref().map(|meta| meta.title.clone()).unwrap_or_default(),
+                pid: window.pid,
+                bundle_id: meta.map(|meta| meta.bundle_id).unwrap_or_default(),
+            },
+        );
+        self.meta.remove(&id);
+        self.motions.remove(&id);
+        let screens = self.screens.clone();
+        self.publish_layouts(&screens, &params);
+        self.publish_state(&screens);
+        Ok(())
+    }
+
+    fn send_next_display(&mut self) -> Result<(), CommandError> {
+        if self.screens.len() < 2 {
+            eprintln!("multi-display skipped");
+            return Ok(());
+        }
+        let from = self.active_display().ok_or(CommandError::NoFocusedWindow)?;
+        let index = self.screens.iter().position(|screen| screen.uuid == from).unwrap_or(0);
+        let target = self.screens[(index + 1) % self.screens.len()].uuid.clone();
+        if self.config.displays.ignored_displays.iter().any(|id| id == &target || id == &from) {
+            eprintln!("multi-display skipped");
+            return Ok(());
+        }
+        let params = layout_params(&self.config);
+        self.move_window_to_display_focused(&from, &target, &params)?;
+        Ok(())
+    }
+
+    fn args_window_floating(&self) -> Option<u64> {
+        None
+    }
+
+    fn unfloat(&mut self, id: u64) -> Result<(), CommandError> {
+        let info = self.floating.remove(&id).ok_or(CommandError::NoFocusedWindow)?;
+        let display = self.active_display().ok_or(CommandError::NoFocusedWindow)?;
+        let params = layout_params(&self.config);
+        let visible = self.viewport_of(&display);
+        let window = Window::new(id, info.pid);
+        let strip = self.strips.entry(display.clone()).or_default();
+        strip.insert(window, info.pid.wrapping_add(1), None, &params, visible);
+        self.meta.insert(
+            id,
+            Meta {
+                pid: info.pid,
+                bundle_id: info.bundle_id.clone(),
+                title: info.title.clone(),
+                owner: info.bundle_id.clone(),
+                display,
+                role: String::new(),
+                subrole: String::new(),
+            },
+        );
+        let screens = self.screens.clone();
+        self.publish_layouts(&screens, &params);
+        self.publish_state(&screens);
+        Ok(())
+    }
+
+    fn move_window_to_display_focused(&mut self, from: &str, target: &str, params: &LayoutParams) -> Result<(), CommandError> {
+        let visible_from = self.viewport_of(from);
+        let window = {
+            let strip = self.strips.get(from).ok_or(CommandError::NoFocusedWindow)?;
+            focused_window(strip).cloned().ok_or(CommandError::NoFocusedWindow)?
+        };
+        let id = window.id.0;
+        if let Some(strip) = self.strips.get_mut(from) {
+            strip.remove(WindowId(id), params, visible_from);
+        }
+        let visible = self.viewport_of(target);
+        let pid = window.pid;
+        let strip = self.strips.entry(target.to_string()).or_default();
+        strip.insert(window, pid, None, params, visible);
+        if let Some(meta) = self.meta.get_mut(&id) {
+            meta.display = target.to_string();
+        }
+        let screens = self.screens.clone();
+        self.publish_layouts(&screens, params);
+        self.publish_state(&screens);
+        Ok(())
+    }
+
+    fn move_window_to_display(&mut self, id: u64, from: &str, target: &str, params: &LayoutParams) {
+        let Some(window) = self.strips.get(from).and_then(|strip| located(strip, id)).map(|(_, window)| window) else {
+            return;
+        };
+        let visible_from = self.viewport_of(from);
+        if let Some(strip) = self.strips.get_mut(from) {
+            strip.remove(WindowId(id), params, visible_from);
+        }
+        let visible = self.viewport_of(target);
+        let pid = window.pid;
+        let strip = self.strips.entry(target.to_string()).or_default();
+        strip.insert(window, pid, None, params, visible);
+        if let Some(meta) = self.meta.get_mut(&id) {
+            meta.display = target.to_string();
+        }
+        let screens = self.screens.clone();
+        self.publish_layouts(&screens, params);
+        self.publish_state(&screens);
+    }
+
+    fn restore_arrived(&mut self, listed: &[ListedWindow]) {
+        let Some(saved) = self.saved.clone() else {
+            return;
+        };
+        let live: Vec<restore::LiveWindow> = listed
+            .iter()
+            .map(|window| restore::LiveWindow {
+                id: window.id,
+                pid: window.pid,
+                bundle_id: config::shown_bundle(&ax::bundle_id(window.pid), &window.owner),
+                title: window.title.clone(),
+                role: String::new(),
+                subrole: String::new(),
+            })
+            .collect();
+        for (saved_index, live_index) in restore::match_windows(&saved.windows, &live) {
+            let saved_window = &saved.windows[saved_index];
+            let window = &listed[live_index];
+            if self.contains_id(window.id) {
+                continue;
+            }
+            self.place_restored(saved_window, window);
+        }
+    }
+
+    fn place_restored(&mut self, saved: &restore::SavedWindow, live: &ListedWindow) {
+        let key = (saved.display.clone(), saved.column);
+        let mut model = Window::new(live.id, live.pid);
+        model.height_ratio = saved.height_ratio;
+        model.original_height = live.bounds.height;
+        let siblings = self.restored_members.get(&key).cloned().unwrap_or_default();
+        let appended = if siblings.is_empty() {
+            None
+        } else {
+            self.strips.get(&saved.display).and_then(|strip| {
+                strip.columns.iter().position(|column| column.windows.iter().any(|window| siblings.contains(&window.id.0)))
+            })
+        };
+        let display = saved.display.clone();
+        let role = saved.role.clone();
+        let subrole = saved.subrole.clone();
+        if let Some(index) = appended {
+            if let Some(strip) = self.strips.get_mut(&display) {
+                if let Some(column) = strip.columns.get_mut(index) {
+                    column.windows.push(model);
+                }
+            }
+        } else {
+            let scroll = self.saved.as_ref().and_then(|session| {
+                session.scroll.iter().find(|(uuid, _)| uuid == &display).map(|(_, scroll)| *scroll)
+            });
+            let focus = self.saved.as_ref().and_then(|session| {
+                session.focus.iter().find(|(uuid, _)| uuid == &display).map(|(_, index)| *index)
+            });
+            let apply_scroll = !self.scroll_applied.contains(&display);
+            {
+                let strip = self.strips.entry(display.clone()).or_default();
+                strip.insert_at(model, saved.column, saved.width_ratio);
+                if apply_scroll {
+                    if let Some(scroll) = scroll {
+                        strip.scroll_x = scroll;
+                    }
+                    if strip.focus == Focus::None && !strip.columns.is_empty() {
+                        let index = usize::try_from(focus.unwrap_or(0).max(0)).unwrap_or(0);
+                        strip.focus = Focus::Column(index.min(strip.columns.len().saturating_sub(1)));
+                    }
+                }
+            }
+            if apply_scroll {
+                self.scroll_applied.insert(display.clone());
+            }
+        }
+        self.restored_members.entry(key).or_default().push(live.id);
+        self.remember(live, &display, &role, &subrole);
+    }
+
+    fn adopt_fresh(&mut self, fresh: Vec<(ListedWindow, Traits)>, front: i32, own_pid: i32, params: &LayoutParams) {
+        let mut absorbed = vec![false; fresh.len()];
+        for index in 0..fresh.len() {
+            if absorbed[index] {
+                continue;
+            }
+            let (window, traits) = &fresh[index];
+            let decision = self.decide(window, traits, own_pid);
+            match decision {
+                Placement::Float => self.remember_float(window),
+                Placement::Fullscreen => {
+                    self.fullscreen.insert(
+                        window.id,
+                        Departed { window: model_from(window), index: 0, display: String::new() },
+                    );
+                }
+                Placement::Manage { slot } => {
+                    let display = self.insert_managed(window, front, slot, params, traits);
+                    for (peer_index, (peer, peer_traits)) in fresh.iter().enumerate().skip(index + 1) {
+                        if absorbed[peer_index] || peer.pid != window.pid || !restore::shares_native_tab(window.bounds, peer.bounds) {
+                            continue;
+                        }
+                        if matches!(self.decide(peer, peer_traits, own_pid), Placement::Manage { .. }) {
+                            self.push_tab(&display, window.id, peer, peer_traits);
+                            absorbed[peer_index] = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn decide(&self, window: &ListedWindow, traits: &Traits, own_pid: i32) -> Placement {
+        let bundle = config::shown_bundle(&ax::bundle_id(window.pid), &window.owner);
+        config::admit(
+            &self.config.rules,
+            AdmitWindow {
+                bundle_id: &bundle,
+                title: &window.title,
+                role: &traits.role,
+                subrole: &traits.subrole,
+                size_settable: traits.size_settable,
+                fixed_size: traits.fixed_size,
+                fullscreen: traits.fullscreen,
+                own_process: window.pid == own_pid,
+            },
+        )
+    }
+
+    fn insert_managed(&mut self, window: &ListedWindow, front: i32, slot: Option<u32>, params: &LayoutParams, traits: &Traits) -> String {
+        let Some(display) = display_for(&self.screens, window.bounds) else {
+            return String::new();
+        };
+        let uuid = display.uuid.clone();
+        let visible = viewport(&display.visible);
+        let role = traits.role.clone();
+        let subrole = traits.subrole.clone();
+        {
+            let strip = self.strips.entry(uuid.clone()).or_default();
+            strip.insert(model_from(window), front, slot, params, visible);
+        }
+        self.remember(window, &uuid, &role, &subrole);
+        uuid
+    }
+
+    fn push_tab(&mut self, display: &str, leader: u64, peer: &ListedWindow, traits: &Traits) {
+        let role = traits.role.clone();
+        let subrole = traits.subrole.clone();
+        let pushed = self.strips.get_mut(display).and_then(|strip| {
+            let column = strip.columns.iter_mut().find(|column| column.windows.iter().any(|window| window.id.0 == leader))?;
+            column.mode = DisplayMode::Tabbed;
+            column.windows.push(model_from(peer));
+            Some(())
+        }).is_some();
+        if pushed {
+            self.remember(peer, display, &role, &subrole);
+        }
+    }
+
+    fn remember_float(&mut self, window: &ListedWindow) {
+        let bundle = config::shown_bundle(&ax::bundle_id(window.pid), &window.owner);
+        eprintln!("auto-float title={} subrole-pending bundle={bundle}", window.title);
+        self.floating.insert(
+            window.id,
+            FloatingWindow { title: window.title.clone(), pid: window.pid, bundle_id: bundle },
+        );
+    }
+
+    fn reinsert(&mut self, window: &ListedWindow, departed: Departed, front: i32, params: &LayoutParams) {
+        let Some(display) = display_for(&self.screens, window.bounds).map(|display| display.uuid.clone()).or_else(|| {
+            if departed.display.is_empty() { None } else { Some(departed.display.clone()) }
+        }) else {
+            return;
+        };
+        let visible = self.viewport_of(&display);
+        let slot = u32::try_from(departed.index.saturating_add(1)).unwrap_or(1);
+        let mut model = departed.window;
+        model.id = WindowId(window.id);
+        model.pid = window.pid;
+        let strip = self.strips.entry(display.clone()).or_default();
+        strip.insert(model, front, Some(slot), params, visible);
+        self.remember(window, &display, "", "");
+    }
+
+    fn remember(&mut self, window: &ListedWindow, display: &str, role: &str, subrole: &str) {
+        let bundle = config::shown_bundle(&ax::bundle_id(window.pid), &window.owner);
+        self.meta.insert(
+            window.id,
+            Meta {
+                pid: window.pid,
+                bundle_id: bundle,
+                title: window.title.clone(),
+                owner: window.owner.clone(),
+                display: display.to_string(),
+                role: role.to_string(),
+                subrole: subrole.to_string(),
+            },
+        );
+    }
+
+    fn contains_id(&self, id: u64) -> bool {
+        self.strips.values().any(|strip| strip.contains(WindowId(id)))
+    }
+
+    fn ignored(&self, window: &ListedWindow) -> bool {
+        let Some(display) = display_for(&self.screens, window.bounds) else {
+            return false;
+        };
+        self.config.displays.ignored_displays.iter().any(|id| id == &display.uuid)
+    }
+
+    fn detach(&mut self, id: u64, params: &LayoutParams) {
+        let Some(display) = self.meta.get(&id).map(|meta| meta.display.clone()) else {
+            return;
+        };
+        if let Some(strip) = self.strips.get_mut(&display) {
+            strip.remove(WindowId(id), params, Viewport { x: 0.0, y: 0.0, width: 1.0, height: 1.0 });
+        }
+        self.meta.remove(&id);
+        self.motions.remove(&id);
+    }
+
+    fn focus_follows_pointer(&mut self) {
+        if !self.config.focus.focus_follows_mouse || !self.pointer_seen || self.pointer_at.elapsed() < Duration::from_millis(100) {
+            return;
+        }
+        let Some((id, display, column, _)) = self.window_under(self.pointer_x, self.pointer_y) else {
+            return;
+        };
+        let Some(strip) = self.strips.get_mut(&display) else {
+            return;
+        };
+        if strip.focus == Focus::Column(column) {
+            return;
+        }
+        let _ = id;
+        strip.focus = Focus::Column(column);
+        let screens = self.screens.clone();
+        self.publish_state(&screens);
+    }
+
+    fn window_under(&self, x: f64, y: f64) -> Option<(u64, String, usize, Frame)> {
+        for (uuid, strip) in &self.strips {
+            for (index, column) in strip.columns.iter().enumerate() {
+                for window in &column.windows {
+                    let Some(frame) = self.last_on_screen.get(&window.id.0).copied() else {
+                        continue;
+                    };
+                    if x >= frame.x && x < frame.right() && y >= frame.y && y < frame.bottom() {
+                        return Some((window.id.0, uuid.clone(), index, frame));
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    fn screen_at(&self, x: f64, y: f64) -> Option<String> {
+        self.screens.iter().find(|screen| x >= screen.frame.x && x < screen.frame.right() && y >= screen.frame.y && y < screen.frame.bottom()).map(|screen| screen.uuid.clone())
+    }
+
+    fn column_spans(&self, display: &str) -> Vec<(f64, f64)> {
+        let Some(strip) = self.strips.get(display) else {
+            return Vec::new();
+        };
+        let mut spans = Vec::new();
+        for column in &strip.columns {
+            let frame = column.windows.first().and_then(|window| self.last_on_screen.get(&window.id.0)).copied();
+            if let Some(frame) = frame {
+                spans.push((frame.x, frame.width));
+            }
+        }
+        spans
+    }
+}
+
+fn focused_window(strip: &Strip) -> Option<&Window> {
+    let column = match strip.focus {
+        Focus::Column(index) => strip.columns.get(index)?,
+        Focus::PinnedLeft => &strip.pinned_left.as_ref()?.column,
+        Focus::PinnedRight => &strip.pinned_right.as_ref()?.column,
+        Focus::None => return None,
+    };
+    column.windows.get(column.focused_window).or_else(|| column.windows.first())
+}
+
+fn located(strip: &Strip, id: u64) -> Option<(usize, Window)> {
+    for (index, column) in strip.columns.iter().enumerate() {
+        if let Some(window) = column.windows.iter().find(|window| window.id.0 == id) {
+            return Some((index, window.clone()));
+        }
+    }
+    if let Some(window) = strip.pinned_left.as_ref().and_then(|pin| pin.column.windows.iter().find(|window| window.id.0 == id)) {
+        return Some((pin_index(strip.pinned_left.as_ref()), window.clone()));
+    }
+    if let Some(window) = strip.pinned_right.as_ref().and_then(|pin| pin.column.windows.iter().find(|window| window.id.0 == id)) {
+        return Some((pin_index(strip.pinned_right.as_ref()), window.clone()));
+    }
+    None
+}
+
+fn pin_index(pin: Option<&strip_core::Pinned>) -> usize {
+    pin.map(|pin| pin.previous_index).unwrap_or(0)
+}
+
+fn model_from(window: &ListedWindow) -> Window {
+    let mut model = Window::new(window.id, window.pid);
+    model.original_height = window.bounds.height;
+    model
 }
 
 fn is_focus_action(action: &str) -> bool {

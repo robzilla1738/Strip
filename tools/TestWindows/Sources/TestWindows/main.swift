@@ -32,7 +32,7 @@ final class Delegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         for index in 0..<count {
-            let origin = NSPoint(x: 80 + CGFloat(index) * 30, y: 80 + CGFloat(index) * 24)
+            let origin = NSPoint(x: 120 + CGFloat(index) * 30, y: 180 + CGFloat(index) * 24)
             let size = NSSize(width: 480, height: 320)
             let window: NSWindow
             if dialog {
@@ -61,8 +61,12 @@ final class Delegate: NSObject, NSApplicationDelegate {
             let field = NSTextField(string: window.title)
             field.frame = NSRect(x: 20, y: 20, width: 220, height: 24)
             window.contentView?.addSubview(field)
-            window.makeKeyAndOrderFront(nil)
-            window.makeFirstResponder(field)
+            if background {
+                window.orderFrontRegardless()
+            } else {
+                window.makeKeyAndOrderFront(nil)
+                window.makeFirstResponder(field)
+            }
             windows.append(window)
         }
         if !keyLog.isEmpty {

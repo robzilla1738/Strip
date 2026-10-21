@@ -64,13 +64,23 @@ The event tap is `kCGHIDEventTap` at the head of the HID stream, as Section 2.7 
 
 ## Command thread
 
-IPC `hello`, `query`, and `subscribe` run on the connection thread. `command`, `set_managing`, `reload_config`, and `shutdown` are posted to a condvar mailbox and applied on the main thread before the result line is written. A focus action emits a `focus` event even when the column index does not change. `toggle_float` and `send_next_display` are known actions and return `ok` without changing the model until the step 9 behaviours land, so a later tick cannot disagree with a float flag that does not exist yet.
+IPC `hello`, `query`, and `subscribe` run on the connection thread. `command`, `set_managing`, `reload_config`, and `shutdown` are posted to a condvar mailbox and applied on the main thread before the result line is written. A focus action emits a `focus` event even when the column index does not change. `toggle_float` removes the focused window from its strip and keeps that frame. Later ticks do not insert it again. `send_next_display` moves it onto the next `NSScreen` and focuses it there. With one screen, or when the target UUID is in `ignored_displays`, the command logs `multi-display skipped` and leaves the strips alone.
 
 ## Animation driver
 
 The spring integrates with semi-implicit Euler. When ζ is 1 and a step would cross the target, the step snaps to the target and zeroes velocity so a critically damped spring cannot overshoot.
 
 Ticks come from `CVDisplayLink` on each display that has a moving strip. The output callback records the host-time interval, schedules `CFRunLoopPerformBlock` on the main run loop, and wakes that loop. The main thread then steps the springs. `NSScreen.displayLink` is the macOS 14 selector API and cannot call the Rust stepper directly; deployment stays at macOS 13, so CVDisplayLink is the driver on every supported release. Windows layout classifies as hidden stay parked once. A full-size column kept just outside the viewport would paint more than the parking sliver, which the on-device parking check rejects.
+
+## Float admission
+
+The on-screen list keeps Core Graphics window levels 0 through 8. Level 0 is a normal window. Levels 3 and 8 are floating and modal panels, which is where a dialog lives. Higher levels are menus and status items and stay out of the list. A window floats when a matching rule sets `floating = true`, when its subrole is present and is not `AXStandardWindow`, when `AXSize` is not settable or min size equals max size, when the bundle is Quick Look, or when the window belongs to the engine process. An empty bundle id is matched as the process owner name, so an unpackaged tool can use `bundle_id = "TestWindows"`. Slot rules apply only after those checks decline to float. Fullscreen windows stay out of every strip until `AXFullScreen` clears, then return at the saved index.
+
+## Session restore and wake
+
+`state.json` is the query snapshot written on each tick and on exit. Launch matches windows for 10 seconds with `restore::match_windows`: `(CGWindowID, pid)` first, then a unique `(bundle, title, role, subrole)`. An ambiguous title matches nothing. Restored columns keep their saved width and are placed without a spring.
+
+Wake and unlock notifications set a flag. The main thread, and `strip debug simulate_wake`, wait 1.5 seconds, re-read the active Space, re-enumerate windows, and re-apply frames with the springs snapped. The existing event tap is enabled again. A second tap is not created, because it would swallow each key twice. Strips stay keyed by display UUID. The Space id from SkyLight is stored on the session. When SkyLight is missing, `fallback_space_key` is the hash used for that id.
 
 ## Definition-of-done search roots
 
