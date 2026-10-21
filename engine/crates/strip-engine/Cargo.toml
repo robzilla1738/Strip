@@ -10,4 +10,9 @@ name = "strip-engine"
 path = "src/main.rs"
 
 [dependencies]
+clap = { version = "4", features = ["derive"] }
+notify = { version = "8", features = ["macos_fsevent"] }
+regex = "1"
+serde = { version = "1", features = ["derive"] }
 strip-core = { path = "../strip-core" }
+toml = "1"
