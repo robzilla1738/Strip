@@ -27,6 +27,9 @@ if ! command -v rustup >/dev/null 2>&1; then
 fi
 rustup toolchain install stable --profile minimal
 rustup target add aarch64-apple-darwin
+if ! command -v cargo-deny >/dev/null 2>&1; then
+  cargo install cargo-deny --locked
+fi
 
 missing_formulae=()
 command -v xcodegen >/dev/null 2>&1 || missing_formulae+=(xcodegen)

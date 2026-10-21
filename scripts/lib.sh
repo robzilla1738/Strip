@@ -57,3 +57,50 @@ strip_load_brand() {
   fi
   set +a
 }
+
+strip_dry_run() {
+  [[ "${DRY_RUN:-}" == "1" ]]
+}
+
+# Print the real value, or the {{NAME}} token when it was never provided.
+strip_show() {
+  local name="$1"
+  local value="${2-}"
+  if strip_is_unset "$value"; then
+    printf '{{%s}}' "$name"
+  else
+    printf '%s' "$value"
+  fi
+}
+
+strip_report_placeholders() {
+  local name
+  local names=(
+    APP_NAME
+    BUNDLE_ID
+    URL_SCHEME
+    APPLE_TEAM_ID
+    DEVELOPER_ID_APPLICATION
+    ASC_KEY_ID
+    ASC_ISSUER_ID
+    ASC_KEY_P8_PATH
+    NOTARY_PROFILE
+    SPARKLE_PUBLIC_ED_KEY
+    SPARKLE_PRIVATE_KEY_PATH
+    APPCAST_URL
+    UPDATE_HOST_UPLOAD
+    DODO_ENV
+    DODO_PRODUCT_ID_1
+    DODO_PRODUCT_ID_3
+    DODO_PRODUCT_ID_5
+    DODO_PRODUCT_ID_20
+    DODO_CHECKOUT_URL
+    TRIAL_DAYS
+    SUPPORT_EMAIL
+    WEBSITE_URL
+    APP_ICON_1024_PNG
+  )
+  for name in "${names[@]}"; do
+    strip_missing "$name" "${!name-}" || true
+  done
+}

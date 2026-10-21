@@ -132,6 +132,18 @@ Separate Spaces, rearrange Spaces, Stage Manager, and macOS 15 tiling all open `
 
 Section 4.6 drops a license as soon as validation returns `valid: false`. The step list says "after grace". The grace period applies only when the network itself fails: 30 days from `last_validated_at`. A negative validation does not wait.
 
+## Branding scan
+
+`Roadmap.md` is the spec, and its compliance rules name a commercial product this app must not copy. `scripts/check-branding.sh` excludes that file and `docs/DECISIONS.md`. Every other tracked path is scanned. A hit fails the check.
+
+## Config watch license
+
+`notify` 8.2 is CC0-1.0, which is not on the Section 6 allow-list. The engine watches the config directory with `fsevent-sys` (MIT) at latency 0. The callback still ignores an event whose config stamp (mtime and length) did not change, so a `state.json` write in that directory does not reload.
+
+## Release dry-run
+
+`DRY_RUN=1` prints each Section 4 command and does not run it. Unset values stay `{{NAME}}` in those lines. The scripts do not write a Team ID, a notarization ticket, or an EdDSA signature. Archive, codesign, notarization, stapling, and the Sparkle appcast each print `SKIPPED (placeholder)` when the values they need are unset, then exit 0.
+
 ## Definition-of-done search roots
 
 `scripts/dod.sh` searches shipped sources (`engine/crates`, `app`, `tools`, `integrations`, `scripts`). It does not flag `TODO` comments inside the unmodified `engine/upstream` snapshot.

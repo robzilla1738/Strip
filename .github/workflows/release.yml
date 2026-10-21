@@ -1,0 +1,54 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  release:
+    runs-on: macos-15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Bootstrap
+        run: scripts/bootstrap.sh
+      - name: Import Developer ID certificate
+        env:
+          DEVELOPER_ID_P12_BASE64: ${{ secrets.DEVELOPER_ID_P12_BASE64 }}
+          DEVELOPER_ID_P12_PASSWORD: ${{ secrets.DEVELOPER_ID_P12_PASSWORD }}
+        run: scripts/import-p12.sh
+      - name: Write release env
+        env:
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          DEVELOPER_ID_APPLICATION: ${{ secrets.DEVELOPER_ID_APPLICATION }}
+          BUNDLE_ID: ${{ secrets.BUNDLE_ID }}
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
+          NOTARY_PROFILE: ${{ secrets.NOTARY_PROFILE }}
+          SPARKLE_PUBLIC_ED_KEY: ${{ secrets.SPARKLE_PUBLIC_ED_KEY }}
+          SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
+          APPCAST_URL: ${{ secrets.APPCAST_URL }}
+          UPDATE_HOST_UPLOAD: ${{ secrets.UPDATE_HOST_UPLOAD }}
+          DODO_ENV: ${{ secrets.DODO_ENV }}
+          DODO_PRODUCT_ID_1: ${{ secrets.DODO_PRODUCT_ID_1 }}
+          DODO_PRODUCT_ID_3: ${{ secrets.DODO_PRODUCT_ID_3 }}
+          DODO_PRODUCT_ID_5: ${{ secrets.DODO_PRODUCT_ID_5 }}
+          DODO_PRODUCT_ID_20: ${{ secrets.DODO_PRODUCT_ID_20 }}
+          DODO_CHECKOUT_URL: ${{ secrets.DODO_CHECKOUT_URL }}
+          TRIAL_DAYS: ${{ secrets.TRIAL_DAYS }}
+          SUPPORT_EMAIL: ${{ secrets.SUPPORT_EMAIL }}
+          WEBSITE_URL: ${{ secrets.WEBSITE_URL }}
+        run: scripts/write-ci-env.sh
+      - name: Release
+        run: scripts/release.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release
+          if-no-files-found: warn
+          path: |
+            build/*.dmg
+            build/*.zip
+            build/updates/appcast.xml

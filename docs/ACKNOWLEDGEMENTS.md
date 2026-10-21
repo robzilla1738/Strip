@@ -32,4 +32,4 @@ The app checks for updates with Sparkle (https://github.com/sparkle-project/Spar
 
 ## Other dependencies
 
-Direct Rust crates are MIT, Apache-2.0, BSD, ISC, Unicode-3.0, Zlib, or MPL-2.0. `cargo deny check licenses` enforces that allow-list. No ChainYourMac material is included.
+Direct Rust crates are MIT, Apache-2.0, BSD, ISC, Unicode-3.0, Zlib, or MPL-2.0. `cargo deny check licenses` enforces that allow-list.

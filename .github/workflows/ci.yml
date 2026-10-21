@@ -1,0 +1,27 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Bootstrap
+        run: scripts/bootstrap.sh
+      - name: Clippy
+        working-directory: engine
+        run: cargo clippy --workspace -- -D warnings
+      - name: Test
+        working-directory: engine
+        run: cargo test --workspace
+      - name: Licenses
+        working-directory: engine
+        run: cargo deny check licenses
+      - name: Swift tests
+        run: |
+          scripts/gen-brand.sh
+          (cd app && xcodegen generate)
+          xcodebuild -project app/Strip.xcodeproj -scheme Strip -configuration Debug -destination 'platform=macOS,arch=arm64' test
