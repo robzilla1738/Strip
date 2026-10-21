@@ -350,6 +350,39 @@ fn copy_window_list(options: u32) -> Vec<ListedWindow> {
     }
 }
 
+/// Windows on another Space are absent from `AXWindows`. Scan element ids with
+/// `_AXUIElementCreateWithRemoteToken` until this window matches, or `limit` ids are tried.
+/// `cursor` resumes the scan on the next tick.
+pub fn resolve_remote(api: &mut AxApi, window: u64, pid: i32, cursor: &mut u64, limit: u64) -> bool {
+    if pid <= 0 || limit == 0 {
+        return false;
+    }
+    if api.windows.contains_key(&window) {
+        return true;
+    }
+    let end = cursor.saturating_add(limit).min(0x8000);
+    let start = *cursor;
+    for element_id in start..end {
+        *cursor = element_id.saturating_add(1);
+        let token = crate::private_api::remote_token_bytes(pid, element_id);
+        let element = crate::private_api::create_remote_element(&token);
+        if element.is_null() {
+            continue;
+        }
+        let matched = api.get_window.is_some_and(|get| {
+            let mut id = 0u32;
+            unsafe { get(element, &mut id) == 0 && u64::from(id) == window }
+        });
+        if matched {
+            unsafe { api.remember(window, pid, element) };
+            unsafe { cf_release(element) };
+            return true;
+        }
+        unsafe { cf_release(element) };
+    }
+    false
+}
+
 /// Resolves AX elements for the listed windows. Falls back to pid + bounds.
 pub fn resolve_elements(api: &mut AxApi, listed: &[ListedWindow]) {
     let mut by_pid: HashMap<i32, Vec<&ListedWindow>> = HashMap::new();
@@ -723,6 +756,15 @@ extern "C" {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resolve_remote_calls_the_token_constructor() {
+        let mut api = AxApi::new(&crate::private_api::PrivateApi::live());
+        let mut cursor = 0u64;
+        let found = resolve_remote(&mut api, 1, std::process::id() as i32, &mut cursor, 1);
+        assert_eq!(cursor, 1);
+        assert!(!found);
+    }
 
     #[test]
     fn raise_fails_when_the_element_is_unknown() {

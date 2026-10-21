@@ -58,6 +58,8 @@ pub struct Runtime {
     park_repaired: HashSet<u64>,
     extra_left: HashSet<String>,
     extra_right: HashSet<String>,
+    /// Resume point for `_AXUIElementCreateWithRemoteToken` scans.
+    remote_cursors: HashMap<u64, u64>,
     pointer_x: f64,
     pointer_y: f64,
     pointer_at: Instant,
@@ -186,6 +188,7 @@ impl Runtime {
             park_repaired: HashSet::new(),
             extra_left: HashSet::new(),
             extra_right: HashSet::new(),
+            remote_cursors: HashMap::new(),
             pointer_x: 0.0,
             pointer_y: 0.0,
             pointer_at: now,
@@ -356,7 +359,7 @@ impl Runtime {
     pub fn resync_after_wake(&mut self) {
         std::thread::sleep(Duration::from_millis(1500));
         let _ = crate::hotkeys::enable_tap();
-        self.space_id = crate::private_api::current_space();
+        self.space_id = space_id_after_wake(self.skylight, crate::private_api::current_space(), self.space_id);
         self.settle = true;
         self.force_resolve = true;
         self.tick();
@@ -573,7 +576,9 @@ impl Runtime {
                 let bundle = meta.bundle_id.clone();
                 let hidden = matches!(placement.visibility, Visibility::Hidden);
                 let mut frame = placement.frame;
-                if hidden {
+                if hidden && self.park_repaired.contains(&id) {
+                    frame = force_park_sliver(frame, display.frame.x, display.frame.right(), display.frame.bottom(), 1.0);
+                } else if hidden {
                     if let Some(repaired) = self.repair_park(id, display, frame) {
                         frame = repaired;
                     }
@@ -1493,7 +1498,16 @@ impl Runtime {
                 continue;
             }
             self.pool.with_api(|api| ax::resolve_elements(api, std::slice::from_ref(window)));
-            let traits = self.pool.with_api(|api| api.describe(window.id));
+            let mut traits = self.pool.with_api(|api| api.describe(window.id));
+            if traits.role.is_empty() && traits.subrole.is_empty() {
+                let mut cursor = self.remote_cursors.get(&window.id).copied().unwrap_or(0);
+                let found = self.pool.with_api(|api| ax::resolve_remote(api, window.id, window.pid, &mut cursor, 128));
+                self.remote_cursors.insert(window.id, cursor);
+                if !found {
+                    continue;
+                }
+                traits = self.pool.with_api(|api| api.describe(window.id));
+            }
             if traits.role.is_empty() && traits.subrole.is_empty() {
                 continue;
             }
@@ -1844,6 +1858,29 @@ fn active_space_id(skylight: bool, space_id: u64, switched: bool) -> u64 {
     }
 }
 
+/// Wake keeps the fallback hash when SkyLight is missing. Replacing it with
+/// `current_space()` (which is `1`) would publish the wrong strip.
+fn space_id_after_wake(skylight: bool, live_space: u64, fallback_hash: u64) -> u64 {
+    if skylight {
+        live_space.max(1)
+    } else {
+        fallback_hash
+    }
+}
+
+/// Later layouts of a relocated park stay at `s = 1`. The ordinary layout
+/// republishes `sliver_used(gap_outer, 5)`, which is 5 whenever the outer gap
+/// is non-zero, even after the corner has been flipped.
+fn force_park_sliver(frame: Frame, min_x: f64, max_x: f64, max_y: f64, sliver: f64) -> Frame {
+    let width = frame.width.max(sliver);
+    let height = frame.height.max(sliver);
+    if frame.x >= min_x {
+        Frame { x: max_x - sliver, y: max_y - sliver, width, height }
+    } else {
+        Frame { x: min_x - width + sliver, y: max_y - sliver, width, height }
+    }
+}
+
 fn park_corner(frame: Frame, display_min_x: f64) -> Corner {
     if frame.x >= display_min_x {
         Corner::BottomRight
@@ -1909,6 +1946,28 @@ mod tests {
         let right = Frame { x: 10.0, y: 0.0, width: 40.0, height: 40.0 };
         assert_eq!(park_corner(left, 0.0), Corner::BottomLeft);
         assert_eq!(park_corner(right, 0.0), Corner::BottomRight);
+    }
+
+    #[test]
+    fn wake_keeps_the_fallback_space_hash() {
+        let hash = crate::private_api::fallback_space_key(&[4, 9, 1]);
+        assert_ne!(hash, 1);
+        assert_eq!(space_id_after_wake(false, 1, hash), hash);
+        assert_eq!(space_id_after_wake(true, 42, hash), 42);
+        assert_eq!(space_id_after_wake(true, 0, hash), 1);
+    }
+
+    #[test]
+    fn a_relocated_park_stays_at_one_point() {
+        let layout = Frame { x: 1728.0 - 5.0, y: 1117.0 - 5.0, width: 800.0, height: 600.0 };
+        let held = force_park_sliver(layout, 0.0, 1728.0, 1117.0, 1.0);
+        assert_eq!(held.x, 1727.0);
+        assert_eq!(held.y, 1116.0);
+        assert!((1728.0 - held.x).abs() < 2.0);
+        let left = Frame { x: 0.0 - 800.0 + 5.0, y: 1112.0, width: 800.0, height: 600.0 };
+        let held_left = force_park_sliver(left, 0.0, 1728.0, 1117.0, 1.0);
+        assert_eq!(held_left.x, 1.0 - 800.0);
+        assert_eq!(held_left.y, 1116.0);
     }
 }
 

@@ -301,6 +301,35 @@ pub fn space_for_window(window: u64) -> Option<u64> {
     }
 }
 
+const REMOTE_TOKEN_MAGIC: u32 = 0x636f_636f;
+const REMOTE_TOKEN_LEN: usize = 0x14;
+
+/// Bytes Paneru passes to `_AXUIElementCreateWithRemoteToken`: pid, magic, element id.
+pub fn remote_token_bytes(pid: i32, element_id: u64) -> [u8; REMOTE_TOKEN_LEN] {
+    let mut token = [0u8; REMOTE_TOKEN_LEN];
+    token[0..4].copy_from_slice(&pid.to_ne_bytes());
+    token[0x8..0xc].copy_from_slice(&REMOTE_TOKEN_MAGIC.to_ne_bytes());
+    token[0xc..0x14].copy_from_slice(&element_id.to_ne_bytes());
+    token
+}
+
+/// One call of `_AXUIElementCreateWithRemoteToken`. Null when the symbol or the element is missing.
+/// The caller owns the returned AX element.
+pub fn create_remote_element(token: &[u8]) -> *mut c_void {
+    let Some(create) = live_symbol_ptr(HISERVICES, "_AXUIElementCreateWithRemoteToken") else {
+        return std::ptr::null_mut();
+    };
+    type Create = unsafe extern "C" fn(*const c_void) -> *mut c_void;
+    let create: Create = unsafe { std::mem::transmute::<*mut c_void, Create>(create) };
+    let data = unsafe { CFDataCreate(std::ptr::null(), token.as_ptr(), token.len() as isize) };
+    if data.is_null() {
+        return std::ptr::null_mut();
+    }
+    let element = unsafe { create(data) };
+    unsafe { CFRelease(data) };
+    element
+}
+
 /// `SLSSpaceGetType` 4 is a fullscreen Space.
 pub fn space_is_fullscreen(space: u64) -> bool {
     let Some(cid) = connection() else {
@@ -457,6 +486,16 @@ mod tests {
     }
 
     #[test]
+    fn remote_token_constructor_is_called() {
+        let token = remote_token_bytes(std::process::id() as i32, 0);
+        assert!(live_symbol_ptr(HISERVICES, "_AXUIElementCreateWithRemoteToken").is_some());
+        let element = create_remote_element(&token);
+        if !element.is_null() {
+            unsafe { CFRelease(element) };
+        }
+    }
+
+    #[test]
     fn other_space_query_does_not_panic() {
         let _ = windows_outside(&[]);
         let _ = space_for_window(1);
@@ -488,6 +527,7 @@ extern "C" {
     fn CFNumberCreate(allocator: *const c_void, kind: i32, value: *const c_void) -> *const c_void;
     fn CFNumberGetValue(number: *const c_void, kind: i32, out: *mut c_void) -> u8;
     fn CFStringCreateWithCString(allocator: *const c_void, text: *const c_char, encoding: u32) -> *const c_void;
+    fn CFDataCreate(allocator: *const c_void, bytes: *const u8, length: isize) -> *const c_void;
     fn CFRelease(value: *const c_void);
 }
 
