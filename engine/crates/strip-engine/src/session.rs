@@ -174,8 +174,11 @@ impl Runtime {
         }
     }
 
-    pub fn drive_swipe(&mut self, fingers: u8, dx: f64, dy: f64, phase: &str) {
+    /// Returns true on the frame a horizontal swipe first arms, once per gesture.
+    pub fn drive_swipe(&mut self, fingers: u8, dx: f64, dy: f64, phase: &str) -> bool {
+        let before = self.gesture.is_armed();
         let _ = self.apply_swipe(fingers, dx, dy, phase);
+        !before && self.gesture.is_armed()
     }
 
     fn apply_swipe(&mut self, fingers: u8, dx: f64, dy: f64, phase: &str) -> Result<(), CommandError> {

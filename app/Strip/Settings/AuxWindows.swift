@@ -54,7 +54,9 @@ struct AboutView: View {
 struct SetupGuideView: View {
     var body: some View {
         ScrollView {
-            Text("Mac Setup checks and their Fix links are listed on the Mac Setup page.")
+            Text(MacSetup.guide)
+                .font(.body)
+                .textSelection(.enabled)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(20)
         }

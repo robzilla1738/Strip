@@ -58,7 +58,7 @@ struct SettingsRoot: View {
         case .displays: DisplaysSection(settings: settings)
         case .rules: RulesSection(settings: settings)
         case .shortcuts: ShortcutsSection(settings: settings)
-        case .macSetup: MacSetupPage()
+        case .macSetup: MacSetupPage(model: model)
         case .about: AboutView()
         }
     }
@@ -403,8 +403,10 @@ private struct ShortcutRow: View {
 }
 
 struct MacSetupPage: View {
+    @ObservedObject var model: AppModel
+
     var body: some View {
-        Text("Mac Setup checks run while this page is open.")
+        MacSetupList(model: model)
             .frame(maxWidth: .infinity, alignment: .leading)
     }
 }

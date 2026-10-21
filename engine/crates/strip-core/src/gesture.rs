@@ -86,6 +86,10 @@ impl Gesture {
         }
     }
 
+    pub fn is_armed(&self) -> bool {
+        self.armed
+    }
+
     pub fn begin(&mut self, fingers: u8, wanted: u8, scroll: f64) {
         self.open = true;
         self.ignored = wanted == 0 || fingers != wanted;

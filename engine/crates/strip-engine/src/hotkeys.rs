@@ -133,7 +133,9 @@ extern "C" fn tap_callback(
     let runtime = unsafe { &mut *ctx.runtime };
     let bus = unsafe { &*ctx.bus };
     if event_type == 29 {
-        swipe::observe(runtime, event_type, event);
+        if swipe::observe(runtime, event_type, event) {
+            bus.emit("tour", serde_json::json!({ "action": "swipe" }));
+        }
         return event;
     }
     if matches!(event_type, 1 | 2 | 5 | 6) {

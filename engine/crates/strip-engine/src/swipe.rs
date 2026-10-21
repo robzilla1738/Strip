@@ -23,15 +23,15 @@ thread_local! {
     static ANCHORS: RefCell<Vec<Anchor>> = const { RefCell::new(Vec::new()) };
 }
 
-pub fn observe(runtime: &mut Runtime, event_type: u32, event: *mut c_void) {
+pub fn observe(runtime: &mut Runtime, event_type: u32, event: *mut c_void) -> bool {
     if event_type != GESTURE || event.is_null() {
-        return;
+        return false;
     }
     let Some(frame) = read_frame(event) else {
-        return;
+        return false;
     };
     let (dx, dy, phase) = ANCHORS.with(|anchors| step_anchors(&mut anchors.borrow_mut(), &frame));
-    runtime.drive_swipe(frame.fingers, dx, dy, phase);
+    runtime.drive_swipe(frame.fingers, dx, dy, phase)
 }
 
 struct Finger {

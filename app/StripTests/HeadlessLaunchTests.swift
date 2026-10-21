@@ -3,6 +3,15 @@ import XCTest
 final class HeadlessLaunchTests: XCTestCase {
     func testHeadlessStartsEngineQueriesStateAndRestarts() throws {
         let app = try locateApp()
+        let info = NSDictionary(contentsOf: app.appendingPathComponent("Contents/Info.plist"))
+        let bundleID = info?["CFBundleIdentifier"] as? String ?? ""
+        XCTAssertFalse(bundleID.isEmpty, "built app has no bundle id")
+        let write = Process()
+        write.executableURL = URL(fileURLWithPath: "/usr/bin/defaults")
+        write.arguments = ["write", bundleID, "hasCompletedOnboarding", "-bool", "false"]
+        try write.run()
+        write.waitUntilExit()
+        XCTAssertEqual(write.terminationStatus, 0)
         let executable = app.appendingPathComponent("Contents/MacOS/\(app.deletingPathExtension().lastPathComponent)")
         let process = Process()
         process.executableURL = executable
@@ -22,6 +31,7 @@ final class HeadlessLaunchTests: XCTestCase {
         XCTAssertTrue(output.contains("hello.ax_trusted="), output)
         XCTAssertTrue(output.contains("query state ok"), output)
         XCTAssertTrue(output.contains("restarted"), output)
+        XCTAssertTrue(output.contains("onboarding:shown"), output)
     }
 
     private func locateApp() throws -> URL {

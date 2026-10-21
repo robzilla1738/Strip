@@ -116,6 +116,10 @@ The engine watches the config file's parent directory, so a temp-file rename is 
 
 `focus_window` focuses the column that owns the window and selects that window as `focused_window` and `active_tab`. The indicator and the tab bar both send that command. Dragging an indicator tile sends `move_column`.
 
+## Mac Setup panes
+
+Separate Spaces, rearrange Spaces, Stage Manager, and macOS 15 tiling all open `x-apple.systempreferences:com.apple.Desktop-Settings.extension`. The table gives that URL for Separate Spaces and names the Desktop & Dock pane for the other three. A missing preference that must be off counts as off. A missing swipe integer is not exactly 0, so that check fails. Tiling is omitted when the OS major version is below 15. Display arrangement only warns. Conflicting apps have no URL; Quit calls `terminate()`. The engine emits a `tour` event with action `swipe` once, when a real HID gesture arms. `inject_gesture` does not emit that event.
+
 ## Definition-of-done search roots
 
 `scripts/dod.sh` searches shipped sources (`engine/crates`, `app`, `tools`, `integrations`, `scripts`). It does not flag `TODO` comments inside the unmodified `engine/upstream` snapshot.

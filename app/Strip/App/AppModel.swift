@@ -13,6 +13,7 @@ final class AppModel: ObservableObject {
     var onCheckForUpdates: () -> Void = {}
     let supervisor = Supervisor()
     let overlays = OverlayController()
+    let tour = TourProgress()
     @Published var settings: SettingsModel?
     private(set) var paths: AppPaths?
     private var client: IpcClient?
@@ -64,6 +65,9 @@ final class AppModel: ObservableObject {
         supervisor.start()
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             self?.connect(to: paths.socket.path)
+        }
+        if Onboarding.shouldShow {
+            OnboardingWindow.shared.show(model: self)
         }
     }
 
@@ -182,7 +186,13 @@ final class AppModel: ObservableObject {
         let events = IpcClient()
         if (try? events.open(socketPath: path, client: "app")) != nil {
             events.onEvent = { [weak self] line in
-                DispatchQueue.main.async { self?.overlays.apply(event: line) }
+                DispatchQueue.main.async {
+                    guard let self else { return }
+                    self.overlays.apply(event: line)
+                    if let action = line.tourAction {
+                        self.tour.receive(action)
+                    }
+                }
             }
             _ = try? events.subscribe(["state", "focus", "indicator", "tour", "log"])
             clientLock.lock()

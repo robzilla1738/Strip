@@ -159,3 +159,12 @@ struct SubscribeRequest: Encodable {
     let type: String
     let events: [String]
 }
+
+extension WireLine {
+    var tourAction: String? {
+        guard event == "tour", case let .object(fields) = data, case let .string(action) = fields["action"] else {
+            return nil
+        }
+        return action
+    }
+}
