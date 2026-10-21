@@ -27,7 +27,7 @@ struct Brand {
             supportEmail: info["StripSupportEmail"] as? String ?? "",
             website: info["StripWebsite"] as? String ?? "",
             trialDaysRaw: info["StripTrialDays"] as? String ?? "",
-            dodoEnv: info["StripDodoEnv"] as? String ?? "",
+            dodoEnv: info["StripPayEnv"] as? String ?? "",
             productIDs: ids.filter { !$0.isEmpty && !$0.contains("{") },
             checkoutURL: info["StripCheckoutURL"] as? String ?? ""
         )

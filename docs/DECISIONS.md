@@ -124,6 +124,14 @@ Separate Spaces, rearrange Spaces, Stage Manager, and macOS 15 tiling all open `
 
 `strip://<action>?n=<int>` uses the host as the action id and `n` as the command argument. `STRIP_ADOPT_ENGINE=1` makes the app connect to `STRIP_SOCKET` and neither spawn nor kill that engine. That mode also skips the login-item side effect and the first-run window, so an on-device check can drive the engine the script already started. A second process with the same bundle id forwards the URL on a distributed notification and exits before starting an engine. The CLI fills a missing `--socket` from `STRIP_SOCKET`, then `STRIP_APP_NAME`, then `CFBundleName` in the enclosing app bundle. Install Command Line Tool links `strip-cli` when that file is present.
 
+## Secret scan
+
+`strings | rg -i "dodo.*key|sk_"` also matches three things that are not credentials. Sparkle's Norwegian string `automatisk_` contains `sk_`. An Info.plist key that puts `Dodo` on the same line as `</key>` matches `dodo.*key`, so the payments host is stored as `StripPayEnv`. Rust v0 symbol names in the engine contain the letters `sk_` (for example `NCINvMsk_`). The check scans the app executable, its debug dylib, the engine, the CLI, and `Info.plist`. It skips `Sparkle.framework` and it ignores a hit whose whole line is a Rust mangled symbol. Any other match fails.
+
+## Invalid license
+
+Section 4.6 drops a license as soon as validation returns `valid: false`. The step list says "after grace". The grace period applies only when the network itself fails: 30 days from `last_validated_at`. A negative validation does not wait.
+
 ## Definition-of-done search roots
 
 `scripts/dod.sh` searches shipped sources (`engine/crates`, `app`, `tools`, `integrations`, `scripts`). It does not flag `TODO` comments inside the unmodified `engine/upstream` snapshot.

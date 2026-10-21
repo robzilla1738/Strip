@@ -55,7 +55,7 @@
   <integer>86400</integer>
   <key>StripCheckoutURL</key>
   <string>$(STRIP_DODO_CHECKOUT_URL)</string>
-  <key>StripDodoEnv</key>
+  <key>StripPayEnv</key>
   <string>$(STRIP_DODO_ENV)</string>
   <key>StripProductID1</key>
   <string>$(STRIP_DODO_PRODUCT_ID_1)</string>

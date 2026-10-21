@@ -14,6 +14,8 @@ final class AppModel: ObservableObject {
     let supervisor = Supervisor()
     let overlays = OverlayController()
     let tour = TourProgress()
+    let licensing = LicenseController.live()
+    private var licenseWantsManaging: Bool?
     @Published var settings: SettingsModel?
     private(set) var paths: AppPaths?
     private var client: IpcClient?
@@ -79,6 +81,25 @@ final class AppModel: ObservableObject {
         }
         if !adoptedEngine && Onboarding.shouldShow {
             OnboardingWindow.shared.show(model: self)
+        }
+        if !adoptedEngine {
+            licensing.onManaging = { [weak self] enabled in
+                self?.applyLicenseManaging(enabled)
+            }
+            licensing.refresh(now: Date())
+            licensing.startSchedule()
+        }
+    }
+
+    private func applyLicenseManaging(_ enabled: Bool) {
+        licenseWantsManaging = enabled
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self else { return }
+            _ = try? self.currentClient()?.setManaging(enabled)
+            DispatchQueue.main.async {
+                self.managing = enabled
+                self.refresh()
+            }
         }
     }
 
@@ -231,6 +252,9 @@ final class AppModel: ObservableObject {
             self.managing = true
             self.refresh()
             self.flushPending()
+            if let enabled = self.licenseWantsManaging {
+                self.applyLicenseManaging(enabled)
+            }
         }
     }
 

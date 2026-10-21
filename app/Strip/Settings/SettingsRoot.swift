@@ -51,7 +51,7 @@ struct SettingsRoot: View {
 
     @ViewBuilder private var sectionView: some View {
         switch section {
-        case .general: GeneralSection(model: model, settings: settings)
+        case .general: GeneralSection(model: model, settings: settings, licensing: model.licensing)
         case .layout: LayoutSection(settings: settings)
         case .trackpad: TrackpadSection(settings: settings)
         case .appearance: AppearanceSection(settings: settings)
@@ -85,23 +85,26 @@ enum SettingsSection: String, CaseIterable, Identifiable {
 private struct GeneralSection: View {
     @ObservedObject var model: AppModel
     @ObservedObject var settings: SettingsModel
+    @ObservedObject var licensing: LicenseController
+    @State private var enteredKey = ""
 
     var body: some View {
         Form {
             Toggle("Launch at login", isOn: binding(\.launchAtLogin))
             Toggle("Start managing on launch", isOn: binding(\.startManagingOnLaunch))
             Toggle("Show in Dock", isOn: binding(\.showInDock))
-            LabeledContent("License", value: licenseLine)
+            LabeledContent("License", value: licensing.phase.statusText)
+            if case .licensed(let masked, let product) = licensing.phase {
+                LabeledContent("Key", value: masked)
+                LabeledContent("Product", value: product)
+                Button("Deactivate") { licensing.deactivate(now: Date()) }
+            }
+            TextField("Enter key", text: $enteredKey)
+            Button("Activate") { licensing.activate(enteredKey, now: Date()) }
+            Button("Buy License") { licensing.openCheckout() }
             LabeledContent("Status", value: model.statusLine)
         }
         .formStyle(.grouped)
-    }
-
-    private var licenseLine: String {
-        if let days = Brand.current.trialDays, days > 0 {
-            return "Trial \(days) days"
-        }
-        return "License required"
     }
 
     private func binding(_ key: WritableKeyPath<ConfigDocument, Bool>) -> Binding<Bool> {
