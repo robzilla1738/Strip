@@ -28,9 +28,31 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Debug hooks. Present only in builds with the `debug-hooks` feature.
+    #[cfg(feature = "debug-hooks")]
+    Debug {
+        #[command(subcommand)]
+        hook: DebugHook,
+    },
     /// An action id, then an optional 1-based index.
     #[command(external_subcommand)]
     Action(Vec<String>),
+}
+
+#[cfg(feature = "debug-hooks")]
+#[derive(Subcommand)]
+enum DebugHook {
+    #[command(name = "inject_gesture")]
+    InjectGesture {
+        #[arg(long)]
+        fingers: u8,
+        #[arg(long)]
+        dx: f64,
+        #[arg(long, default_value_t = 0.0)]
+        dy: f64,
+        #[arg(long)]
+        phase: String,
+    },
 }
 
 fn main() -> ExitCode {
@@ -59,6 +81,17 @@ fn main() -> ExitCode {
     match cli.command {
         Command::Query { what, json: _ } => one_shot(&mut write, &mut reader, &ClientMessage::Query { id: 2, what }, true),
         Command::Subscribe { json: _ } => subscribe(&mut write, &mut reader),
+        #[cfg(feature = "debug-hooks")]
+        Command::Debug { hook } => {
+            let DebugHook::InjectGesture { fingers, dx, dy, phase } = hook;
+            let args = serde_json::json!({ "fingers": fingers, "dx": dx, "dy": dy, "phase": phase });
+            one_shot(
+                &mut write,
+                &mut reader,
+                &ClientMessage::Command { id: 2, action: "inject_gesture".to_string(), args },
+                false,
+            )
+        }
         Command::Action(args) => {
             let Some(action) = args.first() else {
                 eprintln!("missing action");

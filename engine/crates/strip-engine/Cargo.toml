@@ -9,6 +9,9 @@ publish.workspace = true
 name = "strip-engine"
 path = "src/main.rs"
 
+[features]
+debug-hooks = []
+
 [dependencies]
 arc-swap = "1"
 block = "0.1.6"

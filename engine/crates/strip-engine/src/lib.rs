@@ -12,6 +12,7 @@ pub mod parking;
 pub mod private_api;
 pub mod serve;
 pub mod session;
+pub mod swipe;
 pub mod watch;
 pub mod window_api;
 pub mod writer;

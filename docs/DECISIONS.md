@@ -32,7 +32,7 @@ The strip indicator uses `NSVisualEffectView` material `.hudWindow` on a borderl
 
 ## Fling deceleration
 
-`swipe_deceleration` is an exponential decay rate in 1/seconds: `v *= exp(-swipe_deceleration * dt)`.
+`swipe_deceleration` is an exponential decay rate in 1/seconds: `v *= exp(-swipe_deceleration * dt)`. Velocity samples blend with α = 0.3. The 1:1 factor uses the visible-frame width. Past either end of the strip, extra travel is multiplied by 0.3, and lift snaps to the column whose center is nearest the viewport center.
 
 ## Enhanced UI clock
 

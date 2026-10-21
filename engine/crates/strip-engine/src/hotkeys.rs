@@ -10,6 +10,7 @@ use crate::bindings::Binding;
 use crate::bus::Bus;
 use crate::command;
 use crate::session::Runtime;
+use crate::swipe;
 
 const KEY_DOWN: u32 = 10;
 const FLAGS_CHANGED: u32 = 12;
@@ -119,6 +120,10 @@ extern "C" fn tap_callback(
     let ctx = unsafe { &mut *ctx_ptr };
     let runtime = unsafe { &mut *ctx.runtime };
     let bus = unsafe { &*ctx.bus };
+    if event_type == 29 {
+        swipe::observe(runtime, event_type, event);
+        return event;
+    }
     if event_type == FLAGS_CHANGED {
         emit_hold(runtime, bus, event);
         return event;

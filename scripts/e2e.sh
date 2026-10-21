@@ -32,7 +32,7 @@ cleanup() {
 trap cleanup EXIT
 
 echo "building engine"
-(cd "$ROOT/engine" && cargo build -p strip-engine -p strip-cli)
+(cd "$ROOT/engine" && cargo build -p strip-engine --features debug-hooks -p strip-cli --features debug-hooks)
 swiftc -O -o "$DUMP" "$ROOT/tools/dump-frames.swift"
 swiftc -O -o "$TESTAPP" -framework AppKit "$ROOT/tools/TestWindows/Sources/TestWindows/main.swift"
 
@@ -259,6 +259,55 @@ if [[ "$managed" -lt 8 ]]; then
   query || true
   exit 1
 fi
+"$CLI" --socket "$SOCKET" focus_index 1
+scroll_of() {
+  query | jq -r '[.displays[].strips[] | select((.columns | length) > 0) | .scroll_x] | first'
+}
+view_w="$(query | jq -r '.displays[0].visible_frame[2]')"
+before_scroll="$(scroll_of)"
+"$CLI" --socket "$SOCKET" debug inject_gesture --fingers 4 --dx 0 --phase began
+"$CLI" --socket "$SOCKET" debug inject_gesture --fingers 4 --dx=-0.5 --phase moved
+moved_scroll="$(scroll_of)"
+python3 -c '
+import sys
+before, moved, width = map(float, sys.argv[1:])
+delta = moved - before
+expected = 0.5 * width
+if abs(delta - expected) > 2.0:
+    raise SystemExit(f"scroll delta {delta:.2f} expected {expected:.2f} before {before:.2f} moved {moved:.2f}")
+print(f"swipe moved delta={delta:.2f}")
+' "$before_scroll" "$moved_scroll" "$view_w"
+"$CLI" --socket "$SOCKET" debug inject_gesture --fingers 4 --dx 0 --phase ended
+ended_scroll="$(scroll_of)"
+python3 - "$ended_scroll" "$view_w" <<'PY'
+import json, sys
+scroll = float(sys.argv[1])
+width = float(sys.argv[2])
+ratios = [0.5] * 8
+gap = 8.0
+cursor = 0.0
+spans = []
+for index, ratio in enumerate(ratios):
+    column = ratio * width
+    spans.append((cursor, column))
+    cursor += column
+    if index + 1 != len(ratios):
+        cursor += gap
+content = spans[-1][0] + spans[-1][1]
+limit = max(0.0, content - width)
+targets = [min(limit, max(0.0, prefix + column / 2.0 - width / 2.0)) for prefix, column in spans]
+nearest = min(abs(scroll - target) for target in targets)
+if nearest > 2.0:
+    raise SystemExit(f"scroll {scroll:.2f} is {nearest:.2f} from column snaps {targets}")
+print(f"swipe snapped scroll={scroll:.2f}")
+PY
+held="$(scroll_of)"
+"$CLI" --socket "$SOCKET" debug inject_gesture --fingers 3 --dx=-0.5 --phase began
+"$CLI" --socket "$SOCKET" debug inject_gesture --fingers 3 --dx=-0.5 --phase moved
+after_three="$(scroll_of)"
+python3 -c 'import sys; raise SystemExit(0 if abs(float(sys.argv[1]) - float(sys.argv[2])) < 0.5 else 1)' "$held" "$after_three"
+echo "three-finger swipe left scroll at $after_three"
+echo "e2e step 8 ok"
 for _ in 1 2 3 4 5; do
   "$CLI" --socket "$SOCKET" focus_right
 done

@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use strip_core::{layout, CenterMode, DisplayFrame, DisplayMode, Focus, Frame, LayoutParams, Spring, Strip, Viewport, Visibility, Window};
+use strip_core::{layout, CenterMode, DisplayFrame, DisplayMode, Focus, Frame, Gesture, LayoutParams, Spring, Strip, SwipeView, Viewport, Visibility, Window};
 
 use crate::ax::{self, AxApi, DisplayInfo, ListedWindow};
 use crate::config::Config;
@@ -30,6 +30,7 @@ pub struct Runtime {
     motions: HashMap<u64, Motion>,
     driver: DisplayDriver,
     animating: bool,
+    gesture: Gesture,
 }
 
 struct Motion {
@@ -112,7 +113,56 @@ impl Runtime {
             motions: HashMap::new(),
             driver: DisplayDriver::new(),
             animating: false,
+            gesture: Gesture::new(),
         }
+    }
+
+    pub fn drive_swipe(&mut self, fingers: u8, dx: f64, dy: f64, phase: &str) {
+        let _ = self.apply_swipe(fingers, dx, dy, phase);
+    }
+
+    fn apply_swipe(&mut self, fingers: u8, dx: f64, dy: f64, phase: &str) -> Result<(), CommandError> {
+        let display = self.active_display().ok_or(CommandError::NoFocusedWindow)?;
+        let visible = self.viewport_of(&display);
+        let ratios: Vec<f64> = self
+            .strips
+            .get(&display)
+            .map(|strip| strip.columns.iter().map(|column| column.width_ratio).collect())
+            .unwrap_or_default();
+        let scroll = self.strips.get(&display).map(|strip| strip.scroll_x).unwrap_or(0.0);
+        let view = SwipeView::from_ratios(
+            &ratios,
+            visible.width,
+            self.config.layout.gap_inner,
+            self.config.swipe.swipe_sensitivity,
+            self.config.swipe.swipe_natural,
+            self.config.swipe.swipe_deceleration,
+        );
+        let update = match phase {
+            "began" => {
+                self.gesture.begin(fingers, self.config.swipe.swipe_fingers, scroll);
+                strip_core::SwipeUpdate::default()
+            }
+            "moved" => self.gesture.moved(dx, dy, &view, 1.0 / 60.0),
+            "ended" => self.gesture.ended(&view),
+            _ => return Err(CommandError::BadRequest("phase must be began, moved, or ended".to_string())),
+        };
+        let Some(scroll) = update.scroll else {
+            return Ok(());
+        };
+        if let Some(strip) = self.strips.get_mut(&display) {
+            strip.scroll_x = scroll;
+            if let Some(index) = update.focus {
+                if index < strip.columns.len() {
+                    strip.focus = Focus::Column(index);
+                }
+            }
+        }
+        let screens = self.screens.clone();
+        let params = layout_params(&self.config);
+        self.publish_layouts(&screens, &params);
+        self.publish_state(&screens);
+        Ok(())
     }
 
     pub fn is_animating(&self) -> bool {
@@ -197,6 +247,15 @@ impl Runtime {
     /// Apply one command on the calling thread. Focus actions return a snapshot
     /// even when the column index does not change.
     pub fn perform(&mut self, action: &str, args: &serde_json::Value) -> Result<Option<FocusSnap>, CommandError> {
+        #[cfg(feature = "debug-hooks")]
+        if action == "inject_gesture" {
+            let fingers = args.get("fingers").and_then(|value| value.as_u64()).unwrap_or(0) as u8;
+            let dx = args.get("dx").and_then(|value| value.as_f64()).unwrap_or(0.0);
+            let dy = args.get("dy").and_then(|value| value.as_f64()).unwrap_or(0.0);
+            let phase = args.get("phase").and_then(|value| value.as_str()).unwrap_or("");
+            self.apply_swipe(fingers, dx, dy, phase)?;
+            return Ok(None);
+        }
         if !strip_ipc::is_known_action(action) {
             return Err(CommandError::UnknownAction);
         }
