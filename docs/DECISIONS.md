@@ -108,6 +108,14 @@ Section 2.1 places the Rust CLI at `Contents/MacOS/strip` next to the app execut
 
 The Xcode project, scheme, and `app/Strip` directory keep the Section 2.2 names so `xcodebuild -scheme Strip` matches the spec. User-visible strings, the bundle id, and the URL scheme still come from `config/brand.env`.
 
+## Config hot reload
+
+The engine watches the config file's parent directory, so a temp-file rename is observed. The callback signals a `CFRunLoopSource` and wakes the main run loop. A source that was signaled before the loop waits still fires, which a bare `CFRunLoopWakeUp` would miss. The main thread reloads and ticks in that turn, so a new `gap_inner` is in the next query without waiting out the 1 second idle slice. The settings window rewrites the Section 1.6 document. A GUI save does not keep unknown keys.
+
+## Tile and tab clicks
+
+`focus_window` focuses the column that owns the window and selects that window as `focused_window` and `active_tab`. The indicator and the tab bar both send that command. Dragging an indicator tile sends `move_column`.
+
 ## Definition-of-done search roots
 
 `scripts/dod.sh` searches shipped sources (`engine/crates`, `app`, `tools`, `integrations`, `scripts`). It does not flag `TODO` comments inside the unmodified `engine/upstream` snapshot.

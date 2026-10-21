@@ -28,6 +28,7 @@ final class IpcClient {
     private var nextID: UInt64 = 1
     private var token = 0
     private var waiters: [UInt64: (Result<WireLine, Error>) -> Void] = [:]
+    var onEvent: ((WireLine) -> Void)?
 
     func open(socketPath: String, client: String) throws -> WireLine {
         try connect(socketPath)
@@ -48,6 +49,11 @@ final class IpcClient {
     func setManaging(_ enabled: Bool) throws -> WireLine {
         let id = allocate()
         return try roundTrip(ManagingRequest(id: id, type: "set_managing", enabled: enabled), id: id)
+    }
+
+    func subscribe(_ events: [String]) throws -> WireLine {
+        let id = allocate()
+        return try roundTrip(SubscribeRequest(id: id, type: "subscribe", events: events), id: id)
     }
 
     func shutdown() {
@@ -163,7 +169,9 @@ final class IpcClient {
             guard !chunk.isEmpty, let line = try? JSONDecoder().decode(WireLine.self, from: Data(chunk)) else {
                 continue
             }
-            if let id = line.id {
+            if line.type == "event" {
+                onEvent?(line)
+            } else if let id = line.id {
                 deliver(id: id, result: .success(line))
             }
         }

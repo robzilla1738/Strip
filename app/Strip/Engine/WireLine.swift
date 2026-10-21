@@ -153,3 +153,9 @@ struct ManagingRequest: Encodable {
     let type: String
     let enabled: Bool
 }
+
+struct SubscribeRequest: Encodable {
+    let id: UInt64
+    let type: String
+    let events: [String]
+}

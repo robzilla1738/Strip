@@ -16,6 +16,7 @@ use strip_engine::private_api::PrivateApi;
 use strip_engine::serve::{self, Serve};
 use strip_engine::session::Runtime;
 use strip_engine::wake;
+use strip_engine::watch;
 
 #[derive(Parser)]
 #[command(name = "strip-engine", version, about = "Scrolling window engine")]
@@ -131,17 +132,31 @@ fn main() -> ExitCode {
     wake::install();
     let tap = hotkeys::install();
     hotkeys::remember_main_loop();
+    watch::install_reload_source();
+    let _config_watch = match cli.config.as_ref() {
+        Some(path) => match watch::watch_config(path) {
+            Ok(watch) => Some(watch),
+            Err(err) => {
+                eprintln!("config watch: {err}");
+                None
+            }
+        },
+        None => None,
+    };
     runtime.tick();
-    write_state(&cli, &snapshot);
+    write_state(&cli, &snapshot, &bus);
     let mut next_tick = Instant::now() + Duration::from_millis(80);
     loop {
         if lifecycle::stop_requested() {
             runtime.unpark_all();
-            write_state(&cli, &snapshot);
+            write_state(&cli, &snapshot, &bus);
             break;
         }
         if wake::take_request() {
             runtime.resync_after_wake();
+        }
+        if watch::take_dirty() {
+            apply_config(&mut runtime, &cli, &snapshot, &bus);
         }
         // The tap callback runs on this thread while the run loop is pumping.
         // Idle waits are long; IPC, the tap, and the display link wake this thread.
@@ -154,14 +169,17 @@ fn main() -> ExitCode {
             let _ = job.reply.send(response);
         }
         runtime.drain_frames();
+        if watch::take_dirty() {
+            apply_config(&mut runtime, &cli, &snapshot, &bus);
+        }
         if lifecycle::stop_requested() {
             runtime.unpark_all();
-            write_state(&cli, &snapshot);
+            write_state(&cli, &snapshot, &bus);
             break;
         }
         if Instant::now() >= next_tick {
             runtime.tick();
-            write_state(&cli, &snapshot);
+            write_state(&cli, &snapshot, &bus);
             let period = if runtime.is_animating() { 80 } else { 1000 };
             next_tick = Instant::now() + Duration::from_millis(period);
         }
@@ -198,11 +216,23 @@ fn reply(message: &ServerMessage) -> String {
     encode(message).trim_end().to_string()
 }
 
-fn write_state(cli: &Cli, snapshot: &Mutex<String>) {
+fn apply_config(runtime: &mut Runtime, cli: &Cli, snapshot: &Mutex<String>, bus: &Bus) {
+    if let Err(err) = runtime.reload() {
+        eprintln!("config reload: {err}");
+        return;
+    }
+    runtime.tick();
+    write_state(cli, snapshot, bus);
+}
+
+fn write_state(cli: &Cli, snapshot: &Mutex<String>, bus: &Bus) {
     let Some(path) = cli.state.as_ref() else {
         return;
     };
     if let Ok(text) = snapshot.lock() {
         let _ = std::fs::write(path, &*text);
+        if let Ok(value) = serde_json::from_str(text.as_str()) {
+            bus.emit("state", value);
+        }
     }
 }

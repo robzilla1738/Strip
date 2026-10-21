@@ -1391,6 +1391,19 @@ fn is_focus_action(action: &str) -> bool {
     )
 }
 
+/// A tile or tab click focuses that window inside its column.
+fn select_window(column: Option<&mut strip_core::Column>, id: u64) -> bool {
+    let Some(column) = column else {
+        return false;
+    };
+    let Some(index) = column.windows.iter().position(|window| window.id.0 == id) else {
+        return false;
+    };
+    column.focused_window = index;
+    column.active_tab = index;
+    true
+}
+
 fn apply_action(strip: &mut Strip, action: &str, args: &serde_json::Value, params: &LayoutParams, visible: Viewport) -> Result<(), CommandError> {
     match action {
         "focus_left" => strip.focus_left(params, visible),
@@ -1424,9 +1437,9 @@ fn apply_action(strip: &mut Strip, action: &str, args: &serde_json::Value, param
         "pin_right" => strip.pin_right(params, visible),
         "focus_window" => {
             let id = required_u64(args, "window_id")?;
-            if strip.pinned_left.as_ref().is_some_and(|pin| pin.column.windows.iter().any(|window| window.id.0 == id)) {
+            if select_window(strip.pinned_left.as_mut().map(|pin| &mut pin.column), id) {
                 strip.focus = Focus::PinnedLeft;
-            } else if strip.pinned_right.as_ref().is_some_and(|pin| pin.column.windows.iter().any(|window| window.id.0 == id)) {
+            } else if select_window(strip.pinned_right.as_mut().map(|pin| &mut pin.column), id) {
                 strip.focus = Focus::PinnedRight;
             } else {
                 let index = strip
@@ -1434,6 +1447,7 @@ fn apply_action(strip: &mut Strip, action: &str, args: &serde_json::Value, param
                     .iter()
                     .position(|column| column.windows.iter().any(|window| window.id.0 == id))
                     .ok_or(CommandError::NoFocusedWindow)?;
+                select_window(Some(&mut strip.columns[index]), id);
                 strip.focus = Focus::Column(index);
             }
             strip.reveal(params, visible);

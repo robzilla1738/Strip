@@ -12,8 +12,11 @@ final class AppModel: ObservableObject {
 
     var onCheckForUpdates: () -> Void = {}
     let supervisor = Supervisor()
+    let overlays = OverlayController()
+    @Published var settings: SettingsModel?
     private(set) var paths: AppPaths?
     private var client: IpcClient?
+    private var events: IpcClient?
     private var didShutdown = false
     private let clientLock = NSLock()
 
@@ -27,7 +30,23 @@ final class AppModel: ObservableObject {
         let paths = AppPaths.standard(appName: brand.appName)
         self.paths = paths
         try? paths.prepare()
-        NSApp.setActivationPolicy(.regular)
+        let settings = SettingsModel(url: paths.config)
+        settings.onChange = { [weak self] document in
+            document.applyRuntimeSideEffects()
+            self?.overlays.setShowIndicator(document.showIndicator)
+        }
+        settings.document.applyRuntimeSideEffects()
+        overlays.setShowIndicator(settings.document.showIndicator)
+        overlays.onFocus = { [weak self] id in
+            self?.send("focus_window", .object(["window_id": .int(Int(id))]))
+        }
+        overlays.onMove = { [weak self] from, to in
+            self?.send("move_column", .object(["from": .int(from), "to": .int(to)]))
+        }
+        overlays.onTab = { [weak self] id in
+            self?.send("focus_window", .object(["window_id": .int(Int(id))]))
+        }
+        self.settings = settings
         let engine = Bundle.main.bundleURL.appendingPathComponent("Contents/MacOS/strip-engine")
         supervisor.configure(
             engine: engine,
@@ -160,6 +179,16 @@ final class AppModel: ObservableObject {
         clientLock.lock()
         self.client = client
         clientLock.unlock()
+        let events = IpcClient()
+        if (try? events.open(socketPath: path, client: "app")) != nil {
+            events.onEvent = { [weak self] line in
+                DispatchQueue.main.async { self?.overlays.apply(event: line) }
+            }
+            _ = try? events.subscribe(["state", "focus", "indicator", "tour", "log"])
+            clientLock.lock()
+            self.events = events
+            clientLock.unlock()
+        }
         if AXIsProcessTrusted() && !trusted {
             AgentFallback.register(bundleID: Brand.current.bundleID)
         }
@@ -167,6 +196,12 @@ final class AppModel: ObservableObject {
             self.axTrusted = trusted
             self.managing = true
             self.refresh()
+        }
+    }
+
+    func send(_ action: String, _ args: JSONValue) {
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            _ = try? self?.currentClient()?.command(action, args: args)
         }
     }
 

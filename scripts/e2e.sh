@@ -580,6 +580,46 @@ EOF
 fi
 echo "e2e step 9 ok"
 
+"$CLI" --socket "$SOCKET" focus_index 1
+sleep 0.15
+next="$WORK/config.next"
+cat > "$next" <<'EOF'
+[general]
+launch_at_login = false
+start_managing_on_launch = true
+show_in_dock = false
+shortcut_set_version = 1
+
+[layout]
+gap_inner = 16
+EOF
+mv "$next" "$CONFIG"
+python3 - "$CLI" "$SOCKET" <<'PY'
+import json, subprocess, sys, time
+cli, socket = sys.argv[1], sys.argv[2]
+deadline = time.monotonic() + 0.5
+last = ""
+while time.monotonic() < deadline:
+    proc = subprocess.run([cli, "--socket", socket, "query", "state", "--json"], capture_output=True, text=True)
+    last = proc.stdout or proc.stderr
+    try:
+        body = json.loads(proc.stdout)
+        columns = body["displays"][0]["strips"][0]["columns"]
+        left = columns[0]["windows"][0]["frame"]
+        right = columns[1]["windows"][0]["frame"]
+        gap = right[0] - (left[0] + left[2])
+        if abs(gap - 16) < 1.5:
+            print(f"gap_inner reflected {gap:.2f}")
+            raise SystemExit(0)
+    except (KeyError, IndexError, TypeError, json.JSONDecodeError):
+        pass
+    time.sleep(0.03)
+print("gap_inner did not reach 16 within 500 ms")
+print(last[:2000])
+raise SystemExit(1)
+PY
+echo "e2e step 11 ok"
+
 kill -TERM "$ENGINE_PID"
 wait "$ENGINE_PID" || true
 ENGINE_PID=""
