@@ -199,6 +199,12 @@ impl<A: WindowApi + 'static> WriterPool<A> {
         lock(&self.shared.read_backs).get(&window).copied()
     }
 
+    /// Seeds a read-back so parking repair can run without an Accessibility write.
+    #[cfg(test)]
+    pub fn testing_set_read_back(&self, window: u64, frame: Frame) {
+        lock(&self.shared.read_backs).insert(window, frame);
+    }
+
     pub fn shutdown(&mut self) {
         for worker in self.workers.values() {
             worker.state.stop.store(true, Ordering::SeqCst);

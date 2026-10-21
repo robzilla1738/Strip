@@ -64,6 +64,10 @@ pub struct AxApi {
     windows: HashMap<u64, Element>,
     apps: HashMap<i32, Element>,
     get_window: Option<unsafe extern "C" fn(*mut c_void, *mut u32) -> i32>,
+    /// When set, `resolve_remote` still constructs the remote token, then treats
+    /// this window id as the `_AXUIElementGetWindow` match. Production leaves it unset.
+    #[cfg(test)]
+    pub remote_match: Option<u64>,
 }
 
 impl AxApi {
@@ -81,6 +85,8 @@ impl AxApi {
             windows: HashMap::new(),
             apps: HashMap::new(),
             get_window,
+            #[cfg(test)]
+            remote_match: None,
         }
     }
 
@@ -366,7 +372,11 @@ pub fn resolve_remote(api: &mut AxApi, window: u64, pid: i32, cursor: &mut u64, 
         *cursor = element_id.saturating_add(1);
         let token = crate::private_api::remote_token_bytes(pid, element_id);
         let element = crate::private_api::create_remote_element(&token);
+        let forced = remote_forced(api, window);
         if element.is_null() {
+            if forced {
+                return true;
+            }
             continue;
         }
         let matched = api.get_window.is_some_and(|get| {
@@ -379,8 +389,23 @@ pub fn resolve_remote(api: &mut AxApi, window: u64, pid: i32, cursor: &mut u64, 
             return true;
         }
         unsafe { cf_release(element) };
+        if forced {
+            return true;
+        }
     }
     false
+}
+
+fn remote_forced(api: &AxApi, window: u64) -> bool {
+    #[cfg(test)]
+    {
+        api.remote_match == Some(window)
+    }
+    #[cfg(not(test))]
+    {
+        let _ = (api, window);
+        false
+    }
 }
 
 /// Resolves AX elements for the listed windows. Falls back to pid + bounds.

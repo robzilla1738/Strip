@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::ffi::CString;
 use std::os::raw::{c_char, c_int, c_void};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 const RTLD_LAZY: c_int = 1;
 
@@ -313,12 +314,16 @@ pub fn remote_token_bytes(pid: i32, element_id: u64) -> [u8; REMOTE_TOKEN_LEN] {
     token
 }
 
+/// Counts real `_AXUIElementCreateWithRemoteToken` calls. Tests read this.
+pub static REMOTE_TOKEN_CALLS: AtomicU64 = AtomicU64::new(0);
+
 /// One call of `_AXUIElementCreateWithRemoteToken`. Null when the symbol or the element is missing.
 /// The caller owns the returned AX element.
 pub fn create_remote_element(token: &[u8]) -> *mut c_void {
     let Some(create) = live_symbol_ptr(HISERVICES, "_AXUIElementCreateWithRemoteToken") else {
         return std::ptr::null_mut();
     };
+    REMOTE_TOKEN_CALLS.fetch_add(1, Ordering::Relaxed);
     type Create = unsafe extern "C" fn(*const c_void) -> *mut c_void;
     let create: Create = unsafe { std::mem::transmute::<*mut c_void, Create>(create) };
     let data = unsafe { CFDataCreate(std::ptr::null(), token.as_ptr(), token.len() as isize) };

@@ -153,6 +153,18 @@ impl Runtime {
         ax_trusted: bool,
     ) -> Self {
         ax::prepare_app();
+        Self::build(config, config_path, state_path, private_api, state, metrics_body, ax_trusted)
+    }
+
+    fn build(
+        config: Config,
+        config_path: Option<PathBuf>,
+        state_path: Option<PathBuf>,
+        private_api: &PrivateApi,
+        state: Arc<Mutex<String>>,
+        metrics_body: Arc<Mutex<String>>,
+        ax_trusted: bool,
+    ) -> Self {
         let only_owner = std::env::var("STRIP_ONLY_OWNER").ok().filter(|value| !value.is_empty());
         let saved = state_path.as_ref().map(|path| restore::load_session(path)).filter(|session| !session.windows.is_empty());
         let now = Instant::now();
@@ -195,6 +207,24 @@ impl Runtime {
             pointer_seen: false,
             drag: None,
         }
+    }
+
+    /// Test runtime. Does not call `prepare_app` and does not adopt the user's windows.
+    #[cfg(test)]
+    fn blank(skylight: bool) -> Self {
+        let mut api = PrivateApi::live();
+        api.skylight = skylight;
+        let mut runtime = Self::build(
+            Config::default(),
+            None,
+            None,
+            &api,
+            Arc::new(Mutex::new(String::new())),
+            Arc::new(Mutex::new(String::new())),
+            true,
+        );
+        runtime.only_owner = Some("__strip_test_none__".into());
+        runtime
     }
 
     /// Returns true on the frame a horizontal swipe first arms, once per gesture.
@@ -359,12 +389,24 @@ impl Runtime {
     pub fn resync_after_wake(&mut self) {
         std::thread::sleep(Duration::from_millis(1500));
         let _ = crate::hotkeys::enable_tap();
-        self.space_id = space_id_after_wake(self.skylight, crate::private_api::current_space(), self.space_id);
+        self.apply_wake_space();
         self.settle = true;
         self.force_resolve = true;
         self.tick();
         self.settle = false;
         self.force_resolve = false;
+    }
+
+    /// SkyLight re-reads the active Space. Without it, `current_space()` is `1`
+    /// and would replace the fallback hash `switch_space` stored, so the strip
+    /// `publish_layouts` looks up would be gone. Leave that hash in place.
+    fn apply_wake_space(&mut self) {
+        let live = if self.skylight {
+            crate::private_api::current_space()
+        } else {
+            self.space_id
+        };
+        self.space_id = space_id_after_wake(self.skylight, live, self.space_id);
     }
 
     pub fn binding_for(&self, binding: crate::bindings::Binding) -> Option<crate::bindings::ResolvedBinding> {
@@ -576,9 +618,7 @@ impl Runtime {
                 let bundle = meta.bundle_id.clone();
                 let hidden = matches!(placement.visibility, Visibility::Hidden);
                 let mut frame = placement.frame;
-                if hidden && self.park_repaired.contains(&id) {
-                    frame = force_park_sliver(frame, display.frame.x, display.frame.right(), display.frame.bottom(), 1.0);
-                } else if hidden {
+                if hidden {
                     if let Some(repaired) = self.repair_park(id, display, frame) {
                         frame = repaired;
                     }
@@ -1497,7 +1537,6 @@ impl Runtime {
             if self.config.displays.ignored_displays.iter().any(|id| id == &display) {
                 continue;
             }
-            self.pool.with_api(|api| ax::resolve_elements(api, std::slice::from_ref(window)));
             let mut traits = self.pool.with_api(|api| api.describe(window.id));
             if traits.role.is_empty() && traits.subrole.is_empty() {
                 let mut cursor = self.remote_cursors.get(&window.id).copied().unwrap_or(0);
@@ -1507,9 +1546,9 @@ impl Runtime {
                     continue;
                 }
                 traits = self.pool.with_api(|api| api.describe(window.id));
-            }
-            if traits.role.is_empty() && traits.subrole.is_empty() {
-                continue;
+                if traits.role.is_empty() && traits.subrole.is_empty() {
+                    traits = standard_window(traits);
+                }
             }
             if traits.fullscreen {
                 self.depart_fullscreen(window, params);
@@ -1611,10 +1650,12 @@ impl Runtime {
     }
 
     /// Read the parked frame back. A center on another display flips the corner
-    /// and exposes 1 pt, once, until the window is visible again.
+    /// and exposes 1 pt until the window is visible again. Later layouts still
+    /// ask for `sliver_used(gap_outer, 5)`, so a window already repaired keeps
+    /// returning the 1 pt frame instead of that 5 pt corner.
     fn repair_park(&mut self, id: u64, display: &DisplayInfo, parked: Frame) -> Option<Frame> {
         if self.park_repaired.contains(&id) {
-            return None;
+            return Some(force_park_sliver(parked, display.frame.x, display.frame.right(), display.frame.bottom(), 1.0));
         }
         let actual = self.pool.read_back(id)?;
         if actual.width < 1.0 || actual.height < 1.0 {
@@ -1881,6 +1922,17 @@ fn force_park_sliver(frame: Frame, min_x: f64, max_x: f64, max_y: f64, sliver: f
     }
 }
 
+/// A remote token matched this window, but Accessibility has not filled a role yet.
+fn standard_window(mut traits: Traits) -> Traits {
+    if traits.role.is_empty() {
+        traits.role = "AXWindow".to_string();
+    }
+    if traits.subrole.is_empty() {
+        traits.subrole = "AXStandardWindow".to_string();
+    }
+    traits
+}
+
 fn park_corner(frame: Frame, display_min_x: f64) -> Corner {
     if frame.x >= display_min_x {
         Corner::BottomRight
@@ -1968,6 +2020,94 @@ mod tests {
         let held_left = force_park_sliver(left, 0.0, 1728.0, 1117.0, 1.0);
         assert_eq!(held_left.x, 1.0 - 800.0);
         assert_eq!(held_left.y, 1116.0);
+    }
+
+    #[test]
+    fn wake_keeps_the_hash_through_the_session_call() {
+        let hash = crate::private_api::fallback_space_key(&[4, 9, 1]);
+        assert_ne!(hash, 1);
+        let mut runtime = Runtime::blank(false);
+        runtime.space_id = hash;
+        runtime.space_switched = true;
+        runtime.apply_wake_space();
+        runtime.tick();
+        assert_eq!(runtime.space_id, hash);
+        assert_eq!(runtime.active_space(), hash);
+
+        let mut live = Runtime::blank(true);
+        live.space_id = 0;
+        live.apply_wake_space();
+        assert!(live.space_id >= 1);
+    }
+
+    #[test]
+    fn a_second_layout_keeps_the_relocated_park_at_one_point() {
+        let mut runtime = Runtime::blank(false);
+        runtime.space_switched = false;
+        runtime.space_id = 0;
+        let mut main = screen(1728.0);
+        main.uuid = "main".into();
+        main.name = "main".into();
+        let mut side = screen(1728.0);
+        side.uuid = "side".into();
+        side.name = "side".into();
+        side.frame.x = 1728.0;
+        side.visible.x = 1728.0;
+        runtime.screens = vec![main, side];
+        let id = 900_001u64;
+        let mut strip = Strip::new();
+        strip.insert_at(Window::new(id, 424_242), 0, 0.5);
+        strip.scroll_x = 8000.0;
+        runtime.strips.insert(StripKey { display: "main".into(), space: 0 }, strip);
+        runtime.meta.insert(
+            id,
+            Meta {
+                pid: 424_242,
+                bundle_id: "example.park".into(),
+                title: "Park".into(),
+                owner: "Park".into(),
+                display: "main".into(),
+                space: 0,
+                role: "AXWindow".into(),
+                subrole: "AXStandardWindow".into(),
+            },
+        );
+        runtime.pool.testing_set_read_back(
+            id,
+            Frame { x: 1800.0, y: 100.0, width: 400.0, height: 300.0 },
+        );
+        let params = layout_params(&runtime.config);
+        runtime.publish_layouts(&runtime.screens.clone(), &params);
+        assert!(runtime.park_repaired.contains(&id));
+        runtime.screens[0].frame.width = 1600.0;
+        runtime.publish_layouts(&runtime.screens.clone(), &params);
+        let target = runtime.motions.get(&id).expect("parked motion").x.target;
+        assert_eq!(target, 1599.0);
+        assert!((1600.0 - target - 1.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn off_space_remote_token_inserts_the_window() {
+        let mut runtime = Runtime::blank(true);
+        runtime.screens = vec![screen(1728.0)];
+        let id = 900_002u64;
+        runtime.pool.with_api(|api| api.remote_match = Some(id));
+        let before = crate::private_api::REMOTE_TOKEN_CALLS.load(std::sync::atomic::Ordering::Relaxed);
+        let window = ListedWindow {
+            id,
+            pid: 99999,
+            title: "Other Space".into(),
+            owner: "Other".into(),
+            bounds: Frame { x: 100.0, y: 100.0, width: 400.0, height: 300.0 },
+            space: 99,
+        };
+        let params = layout_params(&runtime.config);
+        runtime.place_off_space(std::slice::from_ref(&window), 0, &params);
+        let after = crate::private_api::REMOTE_TOKEN_CALLS.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(after > before);
+        assert!(runtime.contains_id(id));
+        let key = StripKey { display: "main".into(), space: 99 };
+        assert!(runtime.strips.contains_key(&key));
     }
 }
 
