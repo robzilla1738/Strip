@@ -11,8 +11,9 @@ use strip_ipc::{encode, ClientMessage, ServerMessage};
 #[derive(Parser)]
 #[command(name = "strip", version, about = "Scrolling window manager commands")]
 struct Cli {
+    /// Unix socket. When omitted, `STRIP_SOCKET`, then `STRIP_APP_NAME`, then the enclosing app's `CFBundleName`.
     #[arg(long, env = "STRIP_SOCKET")]
-    socket: PathBuf,
+    socket: Option<PathBuf>,
     #[command(subcommand)]
     command: Command,
 }
@@ -59,7 +60,11 @@ enum DebugHook {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
-    let stream = match UnixStream::connect(&cli.socket) {
+    let Some(socket) = cli.socket.or_else(default_socket) else {
+        eprintln!("socket: set --socket or STRIP_SOCKET");
+        return ExitCode::from(1);
+    };
+    let stream = match UnixStream::connect(&socket) {
         Ok(stream) => stream,
         Err(err) => {
             eprintln!("socket: {err}");
@@ -173,6 +178,54 @@ fn print_response(response: &ServerMessage, data_only: bool) -> ExitCode {
         ExitCode::from(1)
     } else {
         ExitCode::SUCCESS
+    }
+}
+
+fn default_socket() -> Option<PathBuf> {
+    if let Ok(name) = std::env::var("STRIP_APP_NAME") {
+        if let Some(path) = named_socket(&name) {
+            return Some(path);
+        }
+    }
+    let exe = std::env::current_exe().ok()?;
+    let mut dir = exe.parent()?;
+    for _ in 0..5 {
+        let plist = dir.join("Info.plist");
+        if let Some(name) = std::fs::read_to_string(&plist).ok().and_then(|text| bundle_name(&text).map(str::to_string)) {
+            return named_socket(&name);
+        }
+        dir = dir.parent()?;
+    }
+    None
+}
+
+fn named_socket(name: &str) -> Option<PathBuf> {
+    if name.is_empty() || name.contains('{') {
+        return None;
+    }
+    let home = std::env::var("HOME").ok()?;
+    Some(PathBuf::from(home).join("Library").join("Application Support").join(name).join("engine.sock"))
+}
+
+fn bundle_name(plist: &str) -> Option<&str> {
+    let key = "<key>CFBundleName</key>";
+    let index = plist.find(key)?;
+    let rest = &plist[index + key.len()..];
+    let start = rest.find("<string>")? + "<string>".len();
+    let end = start + rest[start..].find("</string>")?;
+    let name = rest[start..end].trim();
+    if name.is_empty() || name.contains('{') { None } else { Some(name) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::bundle_name;
+
+    #[test]
+    fn bundle_name_reads_the_plist_string() {
+        let plist = "<key>CFBundleName</key>\n    <string>Example</string>";
+        assert_eq!(bundle_name(plist), Some("Example"));
+        assert_eq!(bundle_name("<key>CFBundleName</key><string>{{APP_NAME}}</string>"), None);
     }
 }
 

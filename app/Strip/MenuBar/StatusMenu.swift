@@ -15,6 +15,7 @@ struct StatusMenu: View {
             .disabled(model.appName.isEmpty)
         Button("Check for Updates…") { model.onCheckForUpdates() }
             .disabled(!model.canCheckForUpdates)
+        Button("Install Command Line Tool…") { model.installCommandLineTool() }
         Divider()
         Menu("Help") {
             Button("Setup Guide") { model.openGuide() }

@@ -28,6 +28,10 @@ cleanup() {
   if [[ -n "${WINDOWS_PID:-}" ]] && kill -0 "$WINDOWS_PID" 2>/dev/null; then
     kill "$WINDOWS_PID" 2>/dev/null || true
   fi
+  if [[ -n "${APP_PID:-}" ]] && kill -0 "$APP_PID" 2>/dev/null; then
+    kill "$APP_PID" 2>/dev/null || true
+    wait "$APP_PID" 2>/dev/null || true
+  fi
   if [[ -f "${WORK:-}/extras.pids" ]]; then
     while read -r pid; do
       kill "$pid" 2>/dev/null || true
@@ -619,6 +623,44 @@ print(last[:2000])
 raise SystemExit(1)
 PY
 echo "e2e step 11 ok"
+
+# shellcheck disable=SC1091
+source "$ROOT/config/brand.env"
+APP="$ROOT/build/DerivedData/Build/Products/Debug/${APP_NAME}.app"
+BIN="$APP/Contents/MacOS/$APP_NAME"
+[[ -x "$BIN" ]]
+LSREGISTER="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
+"$LSREGISTER" -f "$APP" >/dev/null
+STRIP_SOCKET="$SOCKET" STRIP_ADOPT_ENGINE=1 "$BIN" >"$WORK/app.out" 2>&1 &
+APP_PID=$!
+sleep 1
+open "${URL_SCHEME}://focus_index?n=2"
+python3 - "$CLI" "$SOCKET" <<'PY'
+import json, subprocess, sys, time
+cli, socket = sys.argv[1], sys.argv[2]
+deadline = time.monotonic() + 8
+last = ""
+while time.monotonic() < deadline:
+    proc = subprocess.run([cli, "--socket", socket, "query", "state", "--json"], capture_output=True, text=True)
+    last = proc.stdout or proc.stderr
+    try:
+        body = json.loads(proc.stdout)
+        focused = [strip["focused_column"] for display in body["displays"] for strip in display["strips"]]
+        if 1 in focused:
+            print("url focus_index 2 -> column 1")
+            raise SystemExit(0)
+    except (KeyError, TypeError, json.JSONDecodeError):
+        pass
+    time.sleep(0.1)
+print("url scheme did not focus column 1")
+print(last[:2000])
+raise SystemExit(1)
+PY
+kill "$APP_PID" || true
+wait "$APP_PID" 2>/dev/null || true
+APP_PID=""
+"$CLI" --socket "$SOCKET" query state --json >/dev/null
+echo "e2e step 13 ok"
 
 kill -TERM "$ENGINE_PID"
 wait "$ENGINE_PID" || true

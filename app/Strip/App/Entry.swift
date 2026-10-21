@@ -1,4 +1,5 @@
 import AppKit
+import Carbon
 import Sparkle
 import SwiftUI
 
@@ -43,12 +44,55 @@ struct StripApp: App {
 }
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
+    private var duplicate = false
+
     func applicationDidFinishLaunching(_ notification: Notification) {
+        NSAppleEventManager.shared().setEventHandler(
+            self,
+            andSelector: #selector(handleGetURL(_:withReplyEvent:)),
+            forEventClass: AEEventClass(kInternetEventClass),
+            andEventID: AEEventID(kAEGetURL)
+        )
+        let bundle = Bundle.main.bundleIdentifier ?? ""
+        let others = NSRunningApplication.runningApplications(withBundleIdentifier: bundle)
+            .filter { $0.processIdentifier != ProcessInfo.processInfo.processIdentifier }
+        if !others.isEmpty && ProcessInfo.processInfo.environment["STRIP_ADOPT_ENGINE"] != "1" {
+            duplicate = true
+            return
+        }
+        DistributedNotificationCenter.default.addObserver(
+            self,
+            selector: #selector(handleForwardedURL(_:)),
+            name: Notification.Name(bundle + ".open-url"),
+            object: nil
+        )
         AppRuntime.model?.launch()
     }
 
     func applicationWillTerminate(_ notification: Notification) {
         AppRuntime.model?.shutdownForRelaunch()
+    }
+
+    @objc private func handleGetURL(_ event: NSAppleEventDescriptor, withReplyEvent: NSAppleEventDescriptor) {
+        guard let string = event.paramDescriptor(forKeyword: keyDirectObject)?.stringValue,
+              let url = URL(string: string) else { return }
+        if duplicate {
+            let bundle = Bundle.main.bundleIdentifier ?? ""
+            DistributedNotificationCenter.default().postNotificationName(
+                Notification.Name(bundle + ".open-url"),
+                object: url.absoluteString,
+                userInfo: nil,
+                deliverImmediately: true
+            )
+            NSApp.terminate(nil)
+            return
+        }
+        AppRuntime.model?.open(url: url)
+    }
+
+    @objc private func handleForwardedURL(_ note: Notification) {
+        guard let string = note.object as? String, let url = URL(string: string) else { return }
+        AppRuntime.model?.open(url: url)
     }
 }
 

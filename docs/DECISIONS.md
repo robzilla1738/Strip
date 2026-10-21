@@ -120,6 +120,10 @@ The engine watches the config file's parent directory, so a temp-file rename is 
 
 Separate Spaces, rearrange Spaces, Stage Manager, and macOS 15 tiling all open `x-apple.systempreferences:com.apple.Desktop-Settings.extension`. The table gives that URL for Separate Spaces and names the Desktop & Dock pane for the other three. A missing preference that must be off counts as off. A missing swipe integer is not exactly 0, so that check fails. Tiling is omitted when the OS major version is below 15. Display arrangement only warns. Conflicting apps have no URL; Quit calls `terminate()`. The engine emits a `tour` event with action `swipe` once, when a real HID gesture arms. `inject_gesture` does not emit that event.
 
+## URL scheme and an already-running engine
+
+`strip://<action>?n=<int>` uses the host as the action id and `n` as the command argument. `STRIP_ADOPT_ENGINE=1` makes the app connect to `STRIP_SOCKET` and neither spawn nor kill that engine. That mode also skips the login-item side effect and the first-run window, so an on-device check can drive the engine the script already started. A second process with the same bundle id forwards the URL on a distributed notification and exits before starting an engine. The CLI fills a missing `--socket` from `STRIP_SOCKET`, then `STRIP_APP_NAME`, then `CFBundleName` in the enclosing app bundle. Install Command Line Tool links `strip-cli` when that file is present.
+
 ## Definition-of-done search roots
 
 `scripts/dod.sh` searches shipped sources (`engine/crates`, `app`, `tools`, `integrations`, `scripts`). It does not flag `TODO` comments inside the unmodified `engine/upstream` snapshot.

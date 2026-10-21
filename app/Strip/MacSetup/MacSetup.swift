@@ -1,4 +1,5 @@
 import AppKit
+import Combine
 import SwiftUI
 
 struct SetupCheck: Equatable, Identifiable {

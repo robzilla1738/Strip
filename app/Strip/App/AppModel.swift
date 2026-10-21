@@ -19,16 +19,23 @@ final class AppModel: ObservableObject {
     private var client: IpcClient?
     private var events: IpcClient?
     private var didShutdown = false
+    private var adoptedEngine = false
+    private var pendingCommand: URLCommand?
     private let clientLock = NSLock()
 
     func launch() {
+        let env = ProcessInfo.processInfo.environment
+        adoptedEngine = env["STRIP_ADOPT_ENGINE"] == "1"
         let report = AppPrivateAPI.check()
         if !report.missing.isEmpty {
             fputs("private symbols missing: \(report.missing.joined(separator: ", "))\n", stderr)
         }
         let brand = Brand.current
         appName = brand.appName
-        let paths = AppPaths.standard(appName: brand.appName)
+        var paths = AppPaths.standard(appName: brand.appName)
+        if let override = env["STRIP_SOCKET"], !override.isEmpty {
+            paths.socket = URL(fileURLWithPath: override)
+        }
         self.paths = paths
         try? paths.prepare()
         let settings = SettingsModel(url: paths.config)
@@ -36,8 +43,10 @@ final class AppModel: ObservableObject {
             document.applyRuntimeSideEffects()
             self?.overlays.setShowIndicator(document.showIndicator)
         }
-        settings.document.applyRuntimeSideEffects()
         overlays.setShowIndicator(settings.document.showIndicator)
+        if !adoptedEngine {
+            settings.document.applyRuntimeSideEffects()
+        }
         overlays.onFocus = { [weak self] id in
             self?.send("focus_window", .object(["window_id": .int(Int(id))]))
         }
@@ -62,12 +71,26 @@ final class AppModel: ObservableObject {
         supervisor.onChange = { [weak self] in
             DispatchQueue.main.async { self?.refresh() }
         }
-        supervisor.start()
+        if !adoptedEngine {
+            supervisor.start()
+        }
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             self?.connect(to: paths.socket.path)
         }
-        if Onboarding.shouldShow {
+        if !adoptedEngine && Onboarding.shouldShow {
             OnboardingWindow.shared.show(model: self)
+        }
+    }
+
+    func open(url: URL) {
+        guard let command = URLCommand.parse(url, scheme: Brand.current.urlScheme) else { return }
+        pendingCommand = command
+        flushPending()
+    }
+
+    func installCommandLineTool() {
+        DispatchQueue.global(qos: .userInitiated).async {
+            CommandLineInstall.install()
         }
     }
 
@@ -144,6 +167,7 @@ final class AppModel: ObservableObject {
     func shutdownForRelaunch() {
         if didShutdown { return }
         didShutdown = true
+        if adoptedEngine { return }
         supervisor.suppressRestart()
         currentClient()?.shutdown()
         supervisor.waitUntilExit(timeout: 2)
@@ -151,7 +175,7 @@ final class AppModel: ObservableObject {
     }
 
     func refresh() {
-        running = supervisor.currentPID() != nil
+        running = adoptedEngine || supervisor.currentPID() != nil
         if supervisor.gaveUp {
             statusLine = "Engine stopped — Reveal Log / Restart"
         } else if axTrusted == false {
@@ -206,7 +230,14 @@ final class AppModel: ObservableObject {
             self.axTrusted = trusted
             self.managing = true
             self.refresh()
+            self.flushPending()
         }
+    }
+
+    private func flushPending() {
+        guard currentClient() != nil, let command = pendingCommand else { return }
+        pendingCommand = nil
+        send(command.action, command.args)
     }
 
     func send(_ action: String, _ args: JSONValue) {
