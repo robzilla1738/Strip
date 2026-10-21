@@ -42,6 +42,22 @@ The guard restores `AXEnhancedUserInterface` 250 ms after the last write to that
 
 License tests use the shipped `LicenseController` against an in-memory `SecretStore`. The app binds that protocol to the Keychain. Tests do not prompt for Keychain UI.
 
+## Session filter
+
+`STRIP_ONLY_OWNER` limits the engine to windows whose owner name matches. The on-device script sets it to `TestWindows`. Unset, the engine manages regular and accessory apps. The engine never reads this as a config key.
+
+## Parking on macOS 27
+
+The layout asks for a parked origin of `(maxX − s, maxY − s)` with the column size. Accessibility applies that frame for a borderless resizable window: the on-display overlap is 5×5 pt. A titled window is clamped so its title bar stays inside the visible frame (measured top at y ≈ 995 on this display), which exposes about 5×122 pt. `tools/TestWindows` opens borderless resizable windows, marks them `AXStandardWindow`, and keeps `--dialog` panels titled. The engine does not special-case the fixture. It always publishes the layout frame.
+
+## Signals and panic
+
+The SIGTERM and SIGINT handler only sets an atomic and writes one byte to a self-pipe. The main thread un-parks. The panic hook calls the same un-park function on the panicking thread, because the process is already unwinding and will not return to the main loop.
+
+## Accessibility imports
+
+`ax.rs` allows `deprecated` and `unexpected_cfgs`. The `cocoa` 0.26 API is itself deprecated and emits those warnings. SkyLight and `_AXUIElementGetWindow` stay behind `dlsym` in `private_api`.
+
 ## Definition-of-done search roots
 
 `scripts/dod.sh` searches shipped sources (`engine/crates`, `app`, `tools`, `integrations`, `scripts`). It does not flag `TODO` comments inside the unmodified `engine/upstream` snapshot.
