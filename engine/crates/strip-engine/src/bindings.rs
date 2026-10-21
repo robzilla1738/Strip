@@ -235,6 +235,29 @@ pub fn resolve_bindings(
     resolved
 }
 
+pub struct ResolvedBinding {
+    pub action: String,
+    pub n: Option<u32>,
+}
+
+/// The first action whose binding matches this key. Index shortcuts carry `n`.
+pub fn lookup(bindings: &BTreeMap<String, Vec<String>>, pressed: &Binding) -> Option<ResolvedBinding> {
+    for (action, keys) in bindings {
+        for key in keys {
+            let Ok(parsed) = parse_binding(key) else {
+                continue;
+            };
+            if parsed == *pressed {
+                return Some(ResolvedBinding {
+                    action: action.clone(),
+                    n: index_argument(key),
+                });
+            }
+        }
+    }
+    None
+}
+
 /// Digit carried by a `focus_index` / `move_to_index` binding, if any.
 pub fn index_argument(binding_text: &str) -> Option<u32> {
     let key = binding_text.rsplit_once('-')?.1;
@@ -258,6 +281,20 @@ mod tests {
     #[test]
     fn keycode_4_is_h() {
         assert_eq!(keycode_for("h"), Some(4));
+    }
+
+    #[test]
+    fn lookup_matches_only_bound_combinations() {
+        let bindings = default_bindings();
+        let right = lookup(&bindings, &parse_binding("ctrl+alt-l").unwrap()).unwrap();
+        assert_eq!(right.action, "focus_right");
+        assert_eq!(right.n, None);
+        let index = lookup(&bindings, &parse_binding("ctrl+alt-3").unwrap()).unwrap();
+        assert_eq!(index.action, "focus_index");
+        assert_eq!(index.n, Some(3));
+        let moved = lookup(&bindings, &parse_binding("ctrl+alt+shift-h").unwrap()).unwrap();
+        assert_eq!(moved.action, "move_left");
+        assert!(lookup(&bindings, &parse_binding("ctrl+alt-z").unwrap()).is_none());
     }
 
     #[test]

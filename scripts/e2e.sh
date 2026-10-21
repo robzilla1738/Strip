@@ -68,7 +68,7 @@ for _ in $(seq 1 50); do
 done
 [[ -S "$SOCKET" ]]
 
-"$TESTAPP" --count 6 >"$WORK/windows.out" 2>&1 &
+"$TESTAPP" --count 6 --key-log "$WORK/keys.log" >"$WORK/windows.out" 2>&1 &
 WINDOWS_PID=$!
 
 query() {
@@ -169,6 +169,72 @@ fi
 grep -q unknown_action "$WORK/unknown.json"
 echo "unknown_action"
 
+column_of() {
+  query | jq -r '[.displays[].strips[] | select((.columns | length) > 0) | .focused_column] | first'
+}
+before_col="$(column_of)"
+swift "$ROOT/tools/post-key.swift" 37 ctrl,alt
+after_col="$before_col"
+for _ in $(seq 1 40); do
+  after_col="$(column_of)"
+  if [[ "$after_col" != "$before_col" ]]; then
+    break
+  fi
+  sleep 0.05
+done
+[[ "$after_col" -eq $((before_col + 1)) ]]
+echo "ctrl+alt-l focused column $after_col"
+
+focused_ratio() {
+  query | jq -r --argjson col "$1" '[.displays[].strips[] | select((.columns | length) > 0) | .columns[$col].width_ratio] | first'
+}
+before_ratio="$(focused_ratio "$after_col")"
+swift "$ROOT/tools/post-key.swift" 15 ctrl,alt
+seen_ratio="$before_ratio"
+for _ in $(seq 1 40); do
+  seen_ratio="$(focused_ratio "$after_col")"
+  python3 -c 'import sys; raise SystemExit(0 if abs(float(sys.argv[1]) - float(sys.argv[2])) > 0.01 else 1)' "$seen_ratio" "$before_ratio" && break
+  sleep 0.05
+done
+echo "width before=$before_ratio after=$seen_ratio"
+if ! python3 -c 'import sys; raise SystemExit(0 if abs(float(sys.argv[1]) - 0.66) < 0.02 else 1)' "$seen_ratio"; then
+  echo "cycle_width did not reach 0.66"
+  query || true
+  tail -40 "$WORK/engine.out" || true
+  exit 1
+fi
+echo "ctrl+alt-r width $seen_ratio"
+
+window_column() {
+  query | jq -r --argjson id "$1" '[.displays[].strips[].columns | to_entries[] | select(.value.windows[0].id == $id) | .key] | first'
+}
+moved_id="$(query | jq -r --argjson col "$after_col" '[.displays[].strips[] | select((.columns | length) > 0) | .columns[$col].windows[0].id] | first')"
+before_index="$(window_column "$moved_id")"
+swift "$ROOT/tools/post-key.swift" 4 ctrl,alt,shift
+after_index="$before_index"
+for _ in $(seq 1 40); do
+  after_index="$(window_column "$moved_id")"
+  if [[ "$after_index" != "$before_index" ]]; then
+    break
+  fi
+  sleep 0.05
+done
+[[ "$after_index" -eq $((before_index - 1)) ]]
+echo "ctrl+alt+shift-h moved column $before_index -> $after_index"
+
+: > "$WORK/keys.log"
+swift "$ROOT/tools/post-key.swift" 6 ctrl,alt --pid "$WINDOWS_PID"
+got_z=0
+for _ in $(seq 1 40); do
+  if grep -qx 6 "$WORK/keys.log"; then
+    got_z=1
+    break
+  fi
+  sleep 0.05
+done
+[[ "$got_z" == 1 ]]
+echo "ctrl+alt-z reached the text field"
+
 kill -TERM "$ENGINE_PID"
 wait "$ENGINE_PID" || true
 ENGINE_PID=""
@@ -191,3 +257,4 @@ PY
 
 echo "e2e step 4 ok"
 echo "e2e step 5 ok"
+echo "e2e step 6 ok"

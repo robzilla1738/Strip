@@ -107,6 +107,14 @@ impl Runtime {
         self.store_metrics();
     }
 
+    pub fn binding_for(&self, binding: crate::bindings::Binding) -> Option<crate::bindings::ResolvedBinding> {
+        crate::bindings::lookup(&self.config.bindings, &binding)
+    }
+
+    pub fn primary_display(&self) -> Option<String> {
+        self.active_display()
+    }
+
     pub fn set_managing(&mut self, enabled: bool) {
         if enabled {
             self.managing = true;

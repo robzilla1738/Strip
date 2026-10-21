@@ -14,6 +14,7 @@ let titlePrefix = value("--title", fallback: "Window")
 let fixed = flag("--fixed-size")
 let dialog = flag("--dialog")
 let background = flag("--background")
+let keyLog = value("--key-log", fallback: "")
 
 let app = NSApplication.shared
 app.setActivationPolicy(background ? .accessory : .regular)
@@ -61,7 +62,24 @@ final class Delegate: NSObject, NSApplicationDelegate {
             field.frame = NSRect(x: 20, y: 20, width: 220, height: 24)
             window.contentView?.addSubview(field)
             window.makeKeyAndOrderFront(nil)
+            window.makeFirstResponder(field)
             windows.append(window)
+        }
+        if !keyLog.isEmpty {
+            NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+                let line = "\(event.keyCode)\n"
+                if let data = line.data(using: .utf8) {
+                    if FileManager.default.fileExists(atPath: keyLog),
+                       let handle = FileHandle(forWritingAtPath: keyLog) {
+                        handle.seekToEndOfFile()
+                        handle.write(data)
+                        try? handle.close()
+                    } else {
+                        FileManager.default.createFile(atPath: keyLog, contents: data)
+                    }
+                }
+                return event
+            }
         }
         if !background {
             app.activate(ignoringOtherApps: true)

@@ -1,14 +1,16 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use clap::Parser;
 use strip_ipc::{encode, ClientMessage, ServerMessage};
 
 use strip_engine::ax;
 use strip_engine::bus::Bus;
+use strip_engine::command;
 use strip_engine::config::Config;
+use strip_engine::hotkeys;
 use strip_engine::lifecycle;
 use strip_engine::private_api::PrivateApi;
 use strip_engine::serve::{self, Serve};
@@ -78,15 +80,20 @@ fn main() -> ExitCode {
         lifecycle::request_stop();
     }));
     let mut runtime = Runtime::start(config, cli.config.clone(), &private_api, Arc::clone(&snapshot), Arc::clone(&metrics), trusted);
+    let tap = hotkeys::install();
     runtime.tick();
     write_state(&cli, &snapshot);
+    let mut next_tick = Instant::now() + Duration::from_millis(80);
     loop {
         if lifecycle::stop_requested() {
             runtime.unpark_all();
             write_state(&cli, &snapshot);
             break;
         }
-        for job in bus.poll(Duration::from_millis(80)) {
+        // The tap callback runs on this thread while the run loop is pumping.
+        hotkeys::pump(&mut runtime, &bus, 0.02);
+        let _ = tap.as_ref().map(hotkeys::EventTap::alive);
+        for job in bus.poll(Duration::from_millis(0)) {
             let response = dispatch(&mut runtime, &bus, job.message);
             let _ = job.reply.send(response);
         }
@@ -95,8 +102,11 @@ fn main() -> ExitCode {
             write_state(&cli, &snapshot);
             break;
         }
-        runtime.tick();
-        write_state(&cli, &snapshot);
+        if Instant::now() >= next_tick {
+            runtime.tick();
+            write_state(&cli, &snapshot);
+            next_tick = Instant::now() + Duration::from_millis(80);
+        }
     }
     let _ = cli.log;
     ExitCode::SUCCESS
@@ -104,21 +114,8 @@ fn main() -> ExitCode {
 
 fn dispatch(runtime: &mut Runtime, bus: &Bus, message: ClientMessage) -> String {
     match message {
-        ClientMessage::Command { id, action, args } => match runtime.perform(&action, &args) {
-            Ok(focus) => {
-                bus.emit("tour", serde_json::json!({ "action": action }));
-                if let Some(focus) = focus {
-                    bus.emit(
-                        "focus",
-                        serde_json::json!({
-                            "window_id": focus.window_id,
-                            "display": focus.display,
-                            "column": focus.column,
-                        }),
-                    );
-                }
-                reply(&ServerMessage::ok(id))
-            }
+        ClientMessage::Command { id, action, args } => match command::run(runtime, bus, &action, &args) {
+            Ok(()) => reply(&ServerMessage::ok(id)),
             Err(err) => reply(&ServerMessage::error(id, err.code(), err.message())),
         },
         ClientMessage::SetManaging { id, enabled } => {

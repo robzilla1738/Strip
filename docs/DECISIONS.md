@@ -58,6 +58,10 @@ The SIGTERM and SIGINT handler only sets an atomic and writes one byte to a self
 
 `ax.rs` allows `deprecated` and `unexpected_cfgs`. The `cocoa` 0.26 API is itself deprecated and emits those warnings. SkyLight and `_AXUIElementGetWindow` stay behind `dlsym` in `private_api`.
 
+## Synthetic hotkeys
+
+The event tap is `kCGHIDEventTap` at the head of the HID stream, as Section 2.7 specifies. On this OS a freshly compiled helper is not in the PostEvent privacy list, so its `CGEvent.post` stays inside that process. `scripts/e2e.sh` runs `tools/post-key.swift` with the `swift` interpreter, which is allowed to post, and that script calls `CGEvent.post(tap: .cghidEventTap)`.
+
 ## Command thread
 
 IPC `hello`, `query`, and `subscribe` run on the connection thread. `command`, `set_managing`, `reload_config`, and `shutdown` are posted to a condvar mailbox and applied on the main thread before the result line is written. A focus action emits a `focus` event even when the column index does not change. `toggle_float` and `send_next_display` are known actions and return `ok` without changing the model until the step 9 behaviours land, so a later tick cannot disagree with a float flag that does not exist yet.
