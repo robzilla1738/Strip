@@ -1,0 +1,20 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/strip-core",
+  "crates/strip-ipc",
+  "crates/strip-engine",
+  "crates/strip-cli",
+]
+exclude = ["upstream"]
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+publish = false
+version = "1.0.0"
+
+[profile.release]
+lto = false
+codegen-units = 16
+opt-level = 3

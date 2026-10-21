@@ -1,0 +1,14 @@
+target/
+build/
+DerivedData/
+.DS_Store
+*.xcuserstate
+xcuserdata/
+app/Strip.xcodeproj/
+app/Brand.xcconfig
+config/release.env
+config/developer.env
+*.dmg
+*.zip
+.swiftpm/
+**/.build/

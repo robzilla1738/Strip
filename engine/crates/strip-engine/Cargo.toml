@@ -1,0 +1,13 @@
+[package]
+name = "strip-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "strip-engine"
+path = "src/main.rs"
+
+[dependencies]
+strip-core = { path = "../strip-core" }
