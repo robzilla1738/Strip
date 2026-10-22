@@ -14,6 +14,7 @@ use crate::swipe;
 
 const KEY_DOWN: u32 = 10;
 const FLAGS_CHANGED: u32 = 12;
+const GESTURE: u32 = 29;
 const TAP_DISABLED_BY_TIMEOUT: u32 = 0xFFFF_FFFE;
 const TAP_DISABLED_BY_USER: u32 = 0xFFFF_FFFF;
 const KEYCODE_FIELD: u32 = 9;
@@ -47,10 +48,12 @@ pub fn main_loop() -> *mut c_void {
 
 /// Ends the current `pump` so the main loop handles the new work now.
 /// `CFRunLoopWakeUp` alone does not return from `CFRunLoopRunInMode`.
-/// A stop that lands between pumps makes the next pump return at once.
+/// Signaling the main run-loop source ensures a wakeup that lands between
+/// `pump` calls still makes the next `CFRunLoopRunInMode` return at once.
 pub fn wake_main() {
     let run_loop = MAIN_LOOP.load(Ordering::SeqCst);
     if !run_loop.is_null() {
+        crate::watch::signal_main_source();
         unsafe {
             CFRunLoopStop(run_loop);
             CFRunLoopWakeUp(run_loop);
@@ -141,7 +144,7 @@ fn key_mask() -> u64 {
 }
 
 fn listen_mask() -> u64 {
-    let types = [1_u32, 2, 5, 6, FLAGS_CHANGED, 29];
+    let types = [1_u32, 2, 5, 6, FLAGS_CHANGED, GESTURE];
     types.iter().fold(0_u64, |mask, kind| mask | (1_u64 << kind))
 }
 
@@ -162,7 +165,7 @@ extern "C" fn tap_callback(
     let ctx = unsafe { &mut *ctx_ptr };
     let runtime = unsafe { &mut *ctx.runtime };
     let bus = unsafe { &*ctx.bus };
-    if event_type == 29 {
+    if event_type == GESTURE {
         let notice = swipe::observe(runtime, event_type, event);
         if notice.updated || notice.started {
             command::flush_state(runtime, bus);
@@ -181,6 +184,9 @@ extern "C" fn tap_callback(
                         }),
                     );
                 }
+            }
+            if !runtime.swipe_armed() {
+                wake_main();
             }
         }
         if notice.started {

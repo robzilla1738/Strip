@@ -22,6 +22,7 @@ final class OverlayController {
     private var preferredDisplay: String?
     private var modifiersHeld = false
     private var phase = IndicatorPhase.hidden
+    private var indicatorTarget: NSRect?
     private var fadeDeadline: Date?
     private var hideTimer: Timer?
     private var fadeGeneration = 0
@@ -36,8 +37,13 @@ final class OverlayController {
     }
 
     private static let linger: TimeInterval = 1.2
-    private static let fadeOutDuration: TimeInterval = 0.25
-    private static let fadeInDuration: TimeInterval = 0.12
+    private static let fadeOutDuration: TimeInterval = 0.2
+    private static let fadeInDuration: TimeInterval = 0.22
+    private static let entranceDrop: CGFloat = 10
+
+    private var reduceMotion: Bool {
+        NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+    }
 
     init() {
         indicator.onFocus = { [weak self] tile in
@@ -160,16 +166,23 @@ final class OverlayController {
             return
         case .hidden:
             indicator.alphaValue = 0
+            if !reduceMotion, let target = indicatorTarget {
+                indicator.setFrame(target.offsetBy(dx: 0, dy: -Self.entranceDrop), display: false)
+            }
             indicator.orderFrontRegardless()
         case .fadingOut:
             break
         }
         phase = .showing
         fadeGeneration += 1
+        let target = indicatorTarget
         NSAnimationContext.runAnimationGroup { context in
-            context.duration = Self.fadeInDuration
+            context.duration = reduceMotion ? 0.01 : Self.fadeInDuration
             context.timingFunction = CAMediaTimingFunction(name: .easeOut)
             indicator.animator().alphaValue = 1
+            if let target {
+                indicator.animator().setFrame(target, display: true)
+            }
         }
     }
 
@@ -208,10 +221,14 @@ final class OverlayController {
         fadeDeadline = nil
         fadeGeneration += 1
         let generation = fadeGeneration
+        let resting = indicatorTarget ?? indicator.frame
         NSAnimationContext.runAnimationGroup { context in
-            context.duration = Self.fadeOutDuration
+            context.duration = reduceMotion ? 0.01 : Self.fadeOutDuration
             context.timingFunction = CAMediaTimingFunction(name: .easeIn)
             indicator.animator().alphaValue = 0
+            if !reduceMotion {
+                indicator.animator().setFrame(resting.offsetBy(dx: 0, dy: -Self.entranceDrop / 2), display: true)
+            }
         } completionHandler: { [weak self] in
             guard let self, self.fadeGeneration == generation, self.phase == .fadingOut else { return }
             self.phase = .hidden
@@ -235,11 +252,15 @@ final class OverlayController {
         let visible = screen.visibleFrame
         let rect = NSRect(
             x: (visible.minX + (visible.width - size.width) / 2).rounded(),
-            y: visible.minY + 12,
+            y: visible.minY + 14,
             width: size.width,
             height: size.height
         )
-        indicator.place(rect)
+        let targetChanged = indicatorTarget != rect
+        indicatorTarget = rect
+        if phase == .hidden || targetChanged {
+            indicator.place(rect)
+        }
     }
 
     private func placeDecorations() {
@@ -371,15 +392,16 @@ private extension NSWindow {
 
     /// Wraps `content` in Liquid Glass on macOS 26+, otherwise in a masked popover material.
     /// Returns whether glass is used. Glass renders its own shadow, so the window shadow is
-    /// turned off there to avoid doubling it.
+    /// turned off there to avoid doubling it. The bottom strip uses clear glass
+    /// so the desktop refracts through it like the macOS 26 Dock.
     @discardableResult
-    func installChromeBackground(around content: NSView, radius: CGFloat) -> Bool {
+    func installChromeBackground(around content: NSView, radius: CGFloat, clear: Bool = false) -> Bool {
         let bounds = NSRect(origin: .zero, size: frame.size)
         content.frame = bounds
         content.autoresizingMask = [.width, .height]
         if #available(macOS 26, *) {
             let glass = NSGlassEffectView(frame: bounds)
-            glass.style = .regular
+            glass.style = clear ? .clear : .regular
             glass.cornerRadius = radius
             glass.autoresizingMask = [.width, .height]
             glass.contentView = content
@@ -591,14 +613,14 @@ final class IndicatorPanel: NSPanel {
 
     init() {
         super.init(
-            contentRect: NSRect(x: 0, y: 0, width: 240, height: 56),
+            contentRect: NSRect(x: 0, y: 0, width: 240, height: IndicatorArt.pad * 2 + IndicatorArt.tile),
             styleMask: [.borderless, .nonactivatingPanel],
             backing: .buffered,
             defer: false
         )
         isFloatingPanel = true
         configureOverlay(level: chromeLevel)
-        let glass = installChromeBackground(around: tilesView, radius: IndicatorArt.panelRadius)
+        let glass = installChromeBackground(around: tilesView, radius: IndicatorArt.panelRadius, clear: true)
         tilesView.drawsOutline = !glass
         tilesView.onFocus = { [weak self] tile in
             self?.onFocus?(tile)

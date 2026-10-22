@@ -179,6 +179,10 @@ final class AppModel: ObservableObject {
         AuxWindows.shared.showGuide()
     }
 
+    func openShortcuts() {
+        AuxWindows.shared.showShortcuts(model: self)
+    }
+
     func openAbout() {
         AuxWindows.shared.showAbout()
     }
@@ -312,8 +316,8 @@ final class AppModel: ObservableObject {
     /// consecutive states is worth applying; other events keep their order.
     private func enqueue(_ line: WireLine) {
         eventLock.lock()
-        if line.event == "state", let last = pendingEvents.last, last.event == "state" {
-            pendingEvents[pendingEvents.count - 1] = line
+        if line.event == "state", let index = pendingEvents.lastIndex(where: { $0.event == "state" }) {
+            pendingEvents[index] = line
         } else {
             pendingEvents.append(line)
         }

@@ -23,6 +23,55 @@ enum ShortcutCodec {
         ("Window", ["toggle_float", "send_next_display", "pin_left", "pin_right", "stop"]),
     ]
 
+    static let titles: [String: String] = [
+        "focus_left": "Focus Left",
+        "focus_right": "Focus Right",
+        "focus_up": "Focus Up in Stack / Previous Tab",
+        "focus_down": "Focus Down in Stack / Next Tab",
+        "focus_first": "Focus First Column",
+        "focus_last": "Focus Last Column",
+        "focus_index": "Focus Column 1–8 (9 = Last)",
+        "move_to_index": "Move Column to 1–8 (9 = Last)",
+        "move_left": "Move Column Left",
+        "move_right": "Move Column Right",
+        "move_up": "Move Window Up in Stack",
+        "move_down": "Move Window Down in Stack",
+        "move_first": "Move Column to First",
+        "move_last": "Move Column to Last",
+        "cycle_width": "Cycle Column Width",
+        "full_width": "Toggle Full Width",
+        "center": "Center Focused Column",
+        "wider": "Wider (+10%)",
+        "narrower": "Narrower (−10%)",
+        "taller": "Taller in Stack (+10%)",
+        "shorter": "Shorter in Stack (−10%)",
+        "equalize_heights": "Equalize Stack Heights",
+        "stack_left": "Stack into Left Column",
+        "stack_right": "Stack into Right Column",
+        "unstack_right": "Pop Out to Right",
+        "unstack_left": "Pop Out to Left",
+        "toggle_tabbed": "Toggle Tabbed Column",
+        "toggle_float": "Float / Unfloat Window",
+        "send_next_display": "Send to Next Display",
+        "pin_left": "Pin / Unpin Left Edge",
+        "pin_right": "Pin / Unpin Right Edge",
+        "stop": "Stop Managing Windows",
+    ]
+
+    static func title(for action: String) -> String {
+        titles[action] ?? action.replacingOccurrences(of: "_", with: " ").capitalized
+    }
+
+    static func formattedKeys(for action: String, in bindings: [String: [String]] = defaults) -> String {
+        let list = (bindings[action]?.isEmpty == false ? bindings[action] : defaults[action]) ?? []
+        guard !list.isEmpty else { return "Unbound" }
+        if (action == "focus_index" || action == "move_to_index"), list.count > 2,
+           let first = list.first, let last = list.last {
+            return "\(display(first)) … \(display(last))"
+        }
+        return list.map(display).joined(separator: "  /  ")
+    }
+
     static var defaults: [String: [String]] {
         [
             "focus_left": ["ctrl+alt-h", "ctrl+alt-left"],
@@ -112,7 +161,19 @@ enum ShortcutCodec {
         return prefix + translated(keycode)
     }
 
+    private static let symbolOverrides: [UInt16: String] = [
+        0x7b: "←",
+        0x7c: "→",
+        0x7d: "↓",
+        0x7e: "↑",
+        0x18: "=",
+        0x1b: "-",
+        0x1e: "]",
+        0x21: "[",
+    ]
+
     static func translated(_ keycode: UInt16) -> String {
+        if let symbol = symbolOverrides[keycode] { return symbol }
         if let layout = layoutLabel(keycode) { return layout }
         return name(for: keycode)?.uppercased() ?? "?"
     }

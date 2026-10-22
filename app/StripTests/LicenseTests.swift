@@ -88,6 +88,26 @@ final class LicenseTests: XCTestCase {
         XCTAssertEqual(controller.phase, .unlicensed(message: "License required"))
     }
 
+    func testUnconfiguredBuildAllowsManaging() {
+        let store = MemorySecretStore()
+        let environment = LicenseEnvironment(
+            appName: "Example",
+            productIDs: [],
+            trialDays: 0,
+            machineName: "Example-0123456789ab",
+            baseURL: nil,
+            checkoutURL: ""
+        )
+        let controller = LicenseController(environment: environment, store: store, session: .shared)
+        var decisions: [Bool] = []
+        controller.onManaging = { decisions.append($0) }
+        XCTAssertEqual(controller.phase, .notConfigured)
+        controller.refresh(now: date(0))
+        XCTAssertEqual(controller.phase, .notConfigured)
+        XCTAssertTrue(controller.phase.allowsManaging)
+        XCTAssertFalse(decisions.contains(false))
+    }
+
     private func make() -> (LicenseController, MemorySecretStore) {
         let store = MemorySecretStore()
         let configuration = URLSessionConfiguration.ephemeral

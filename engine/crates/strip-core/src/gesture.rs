@@ -3,11 +3,19 @@
 //! Δscroll = −Δ(mean normalized x) × sensitivity × viewport width when `natural` is set.
 //! The opposite sign is used otherwise. Past the first or last column the extra travel is scaled by 0.3.
 
-const RECOGNITION_PT: f64 = 8.0;
+const RECOGNITION_PT: f64 = 4.0;
+/// Diagonal travel stays undecided until one axis dominates or this much
+/// travel forces a decision by the larger axis.
+const DECISION_PT: f64 = 14.0;
 const DOMINANCE: f64 = 1.5;
 const RUBBER: f64 = 0.3;
-const VELOCITY_BLEND: f64 = 0.3;
+/// Velocity smoothing time constant, so the estimate does not depend on the
+/// trackpad's event rate.
+const VELOCITY_TAU_S: f64 = 0.05;
+const MAX_VELOCITY: f64 = 12_000.0;
 const REST_SPEED: f64 = 5.0;
+const FLICK_SPEED: f64 = 300.0;
+const FLICK_MIN_TRAVEL_PT: f64 = 20.0;
 
 #[derive(Clone, Debug)]
 pub struct SwipeView {
@@ -58,6 +66,11 @@ impl SwipeView {
         self
     }
 
+    pub fn with_spans(mut self, spans: Vec<(f64, f64)>) -> Self {
+        self.spans = spans;
+        self
+    }
+
     pub fn limits(&self) -> (f64, f64) {
         let content = self.spans.last().map(|(prefix, width)| prefix + width).unwrap_or(0.0);
         (0.0, (content - self.view_width).max(0.0))
@@ -72,6 +85,9 @@ pub struct Gesture {
     origin: f64,
     accum_x: f64,
     accum_y: f64,
+    /// `accum_x` at the moment the swipe armed; travel before arming is the
+    /// recognition dead zone and must not jump the strip.
+    arm_x: f64,
     velocity: f64,
     primed: bool,
     scroll: f64,
@@ -92,6 +108,7 @@ impl Gesture {
             origin: 0.0,
             accum_x: 0.0,
             accum_y: 0.0,
+            arm_x: 0.0,
             velocity: 0.0,
             primed: false,
             scroll: 0.0,
@@ -124,6 +141,7 @@ impl Gesture {
         self.scroll = scroll;
         self.accum_x = 0.0;
         self.accum_y = 0.0;
+        self.arm_x = 0.0;
         self.velocity = 0.0;
         self.primed = false;
     }
@@ -137,22 +155,32 @@ impl Gesture {
         let travel_x = self.accum_x.abs() * view.viewport_width;
         let travel_y = self.accum_y.abs() * view.viewport_width;
         if !self.armed {
-            if travel_x.hypot(travel_y) < RECOGNITION_PT {
+            let travel = travel_x.hypot(travel_y);
+            if travel < RECOGNITION_PT {
                 return SwipeUpdate::default();
             }
-            if travel_x <= travel_y * DOMINANCE {
+            let horizontal = travel_x >= travel_y * DOMINANCE;
+            let vertical = travel_y >= travel_x * DOMINANCE;
+            if !horizontal && !vertical && travel < DECISION_PT {
+                // Diagonal so far: keep watching instead of killing the swipe.
+                return SwipeUpdate::default();
+            }
+            if vertical || (!horizontal && travel_y > travel_x) {
                 self.ignored = true;
                 return SwipeUpdate::default();
             }
             self.armed = true;
+            self.arm_x = self.accum_x;
         }
-        let delta = tracking_delta(self.accum_x, view);
+        let delta = tracking_delta(self.accum_x - self.arm_x, view);
         let (min, max) = view.limits();
         let next = rubber_band(self.origin + delta, min, max);
-        if dt > 0.0 {
-            let instant = tracking_delta(dx, view) / dt;
+        let step_pt = (dx * view.viewport_width).abs();
+        if dt > 0.0 && (step_pt >= 0.25 || !self.primed || dt >= 0.04) {
+            let instant = (tracking_delta(dx, view) / dt).clamp(-MAX_VELOCITY, MAX_VELOCITY);
             self.velocity = if self.primed {
-                VELOCITY_BLEND * instant + (1.0 - VELOCITY_BLEND) * self.velocity
+                let blend = 1.0 - (-dt / VELOCITY_TAU_S).exp();
+                blend * instant + (1.0 - blend) * self.velocity
             } else {
                 instant
             };
@@ -171,16 +199,25 @@ impl Gesture {
             return SwipeUpdate::default();
         }
         let (min, max) = view.limits();
-        let mut scroll = self.scroll;
-        let mut velocity = self.velocity;
-        let mut elapsed = 0.0;
-        while elapsed < 1.5 && velocity.abs() > REST_SPEED {
-            let dt = 1.0 / 60.0;
-            velocity = decay_velocity(velocity, view.deceleration, dt);
-            scroll = rubber_band(scroll + velocity * dt, min, max);
-            elapsed += dt;
+        // Exponential decay travels velocity / deceleration in total; project
+        // the landing point analytically instead of stepping a rubber band.
+        let landing = if self.velocity.abs() > REST_SPEED {
+            self.scroll + self.velocity / view.deceleration.max(0.1)
+        } else {
+            self.scroll
         }
-        let (snapped, index) = snap_column(scroll, &view.spans, view.view_width, view.center);
+        .clamp(min, max);
+        let (mut snapped, mut index) = snap_column(landing, &view.spans, view.view_width, view.center);
+        let net = self.scroll - self.origin;
+        if self.velocity.abs() >= FLICK_SPEED
+            && net.abs() >= FLICK_MIN_TRAVEL_PT
+            && net * self.velocity > 0.0
+            && (snapped - self.scroll) * self.velocity < -1.0
+        {
+            if let Some(forward) = snap_column_directed(self.scroll, self.velocity, &view.spans, view.view_width, view.center) {
+                (snapped, index) = forward;
+            }
+        }
         self.scroll = snapped;
         SwipeUpdate { scroll: Some(snapped), focus: Some(index) }
     }
@@ -244,6 +281,40 @@ pub fn snap_column(scroll: f64, spans: &[(f64, f64)], viewport: f64, center: boo
     (best_scroll, best_index)
 }
 
+fn snap_column_directed(
+    scroll: f64,
+    velocity: f64,
+    spans: &[(f64, f64)],
+    viewport: f64,
+    center: bool,
+) -> Option<(f64, usize)> {
+    if spans.is_empty() || viewport <= 0.0 {
+        return None;
+    }
+    let content = spans.last().map(|(prefix, width)| prefix + width).unwrap_or(0.0);
+    let max = (content - viewport).max(0.0);
+    let mut best: Option<(f64, usize, f64)> = None;
+    for (index, (prefix, width)) in spans.iter().enumerate() {
+        let stops = if center {
+            [Some(prefix + width / 2.0 - viewport / 2.0), None]
+        } else {
+            [Some(*prefix), Some(prefix + width - viewport)]
+        };
+        for stop in stops.into_iter().flatten() {
+            let target = stop.clamp(0.0, max);
+            let delta = target - scroll;
+            if delta * velocity <= 1.0 {
+                continue;
+            }
+            let distance = delta.abs();
+            if best.is_none_or(|(_, _, best_dist)| distance < best_dist - 1e-9) {
+                best = Some((target, index, distance));
+            }
+        }
+    }
+    best.map(|(target, index, _)| (target, index))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -257,9 +328,26 @@ mod tests {
         let view = view(1000.0);
         let mut gesture = Gesture::new();
         gesture.begin(4, 4, 20.0);
-        let update = gesture.moved(-0.5, 0.0, &view, 1.0 / 60.0);
+        // The arming frame only crosses the recognition dead zone.
+        let armed = gesture.moved(-0.02, 0.0, &view, 1.0 / 60.0);
+        assert!((armed.scroll.expect("armed") - 20.0).abs() < 1e-6);
+        let update = gesture.moved(-0.48, 0.0, &view, 1.0 / 60.0);
         let scroll = update.scroll.expect("tracking");
-        assert!((scroll - (20.0 + 500.0)).abs() < 1e-6, "scroll {scroll}");
+        assert!((scroll - (20.0 + 480.0)).abs() < 1e-6, "scroll {scroll}");
+    }
+
+    #[test]
+    fn a_diagonal_start_can_still_become_a_swipe() {
+        let view = view(1000.0);
+        let mut gesture = Gesture::new();
+        gesture.begin(4, 4, 0.0);
+        let diagonal = gesture.moved(-0.010, 0.009, &view, 1.0 / 60.0);
+        assert!(diagonal.scroll.is_none());
+        assert!(!gesture.is_armed());
+        gesture.moved(-0.02, 0.0, &view, 1.0 / 60.0);
+        assert!(gesture.is_armed());
+        let update = gesture.moved(-0.1, 0.0, &view, 1.0 / 60.0);
+        assert!(update.scroll.expect("tracking") > 50.0);
     }
 
     #[test]
@@ -298,7 +386,8 @@ mod tests {
         let view = view(1000.0);
         let mut gesture = Gesture::new();
         gesture.begin(4, 4, 0.0);
-        let forward = gesture.moved(0.2, 0.0, &view, 1.0 / 60.0).scroll.unwrap();
+        gesture.moved(0.02, 0.0, &view, 1.0 / 60.0);
+        let forward = gesture.moved(0.18, 0.0, &view, 1.0 / 60.0).scroll.unwrap();
         let back = gesture.moved(-0.35, 0.0, &view, 1.0 / 60.0).scroll.unwrap();
         assert!(forward < -1.0, "forward {forward}");
         assert!(back > forward, "back {back} forward {forward}");

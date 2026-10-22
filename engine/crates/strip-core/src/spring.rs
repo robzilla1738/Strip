@@ -36,15 +36,21 @@ impl Spring {
             self.v = 0.0;
             return true;
         }
-        let accel = -2.0 * zeta * omega * self.v - omega * omega * (self.x - self.target);
-        self.v += accel * dt;
-        let next = self.x + self.v * dt;
-        if (zeta - 1.0).abs() < 1e-9 && (self.x - self.target) * (next - self.target) < 0.0 {
-            self.x = self.target;
-            self.v = 0.0;
-            return true;
+        // Substep so a dropped frame integrates the same curve as a clean
+        // 120/240 Hz cadence instead of ringing near the stability limit.
+        let steps = (dt / (1.0 / 240.0)).ceil() as u32;
+        let h = dt / f64::from(steps.max(1));
+        for _ in 0..steps.max(1) {
+            let accel = -2.0 * zeta * omega * self.v - omega * omega * (self.x - self.target);
+            self.v += accel * h;
+            let next = self.x + self.v * h;
+            if (zeta - 1.0).abs() < 1e-9 && (self.x - self.target) * (next - self.target) < 0.0 {
+                self.x = self.target;
+                self.v = 0.0;
+                return true;
+            }
+            self.x = next;
         }
-        self.x = next;
         (self.x - self.target).abs() < 0.5 && self.v.abs() < 5.0
     }
 }

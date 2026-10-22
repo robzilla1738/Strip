@@ -65,6 +65,7 @@ unsafe impl Sync for Element {}
 pub struct AxApi {
     windows: HashMap<u64, Element>,
     apps: HashMap<i32, Element>,
+    observers: HashMap<i32, Element>,
     get_window: Option<unsafe extern "C" fn(*mut c_void, *mut u32) -> i32>,
     /// When set, `resolve_remote` still constructs the remote token, then treats
     /// this window id as the `_AXUIElementGetWindow` match. Production leaves it unset.
@@ -89,6 +90,7 @@ impl AxApi {
         Self {
             windows: HashMap::new(),
             apps: HashMap::new(),
+            observers: HashMap::new(),
             get_window,
             #[cfg(test)]
             remote_match: None,
@@ -97,18 +99,34 @@ impl AxApi {
         }
     }
 
+    pub fn get_window_fn(&self) -> Option<unsafe extern "C" fn(*mut c_void, *mut u32) -> i32> {
+        self.get_window
+    }
+
     /// # Safety
     /// `element` is an AXUIElement the caller owns a retain for. This stores an extra retain.
     pub unsafe fn remember(&mut self, id: u64, pid: i32, element: *mut c_void) {
         if element.is_null() || self.windows.contains_key(&id) {
             return;
         }
+        // Bound every window-element call too; elements built from a remote
+        // token may not inherit the application element's timeout, and one
+        // hung app must not stall its writer worker for seconds.
+        unsafe { AXUIElementSetMessagingTimeout(element, 0.25) };
         unsafe { cf_retain(element) };
         self.windows.insert(id, Element(element));
-        if let Some(app) = self.apps.get(&pid) {
-            let _ = app;
+        let app = if let Some(app) = self.apps.get(&pid) {
+            app.0
         } else if let Some(app) = app_element(pid) {
             self.apps.insert(pid, Element(app));
+            app
+        } else {
+            std::ptr::null_mut()
+        };
+        if !app.is_null() && !self.observers.contains_key(&pid) {
+            if let Some(observer) = unsafe { create_observer(pid, app) } {
+                self.observers.insert(pid, Element(observer));
+            }
         }
     }
 }
@@ -252,7 +270,7 @@ pub fn warp_cursor(x: f64, y: f64) {
 
 impl Drop for AxApi {
     fn drop(&mut self) {
-        for element in self.windows.values().chain(self.apps.values()) {
+        for element in self.windows.values().chain(self.apps.values()).chain(self.observers.values()) {
             unsafe { cf_release(element.0) };
         }
     }
@@ -453,32 +471,51 @@ fn remote_forced(api: &AxApi, window: u64) -> bool {
     }
 }
 
-/// Resolves AX elements for the listed windows. Falls back to pid + bounds.
-pub fn resolve_elements(api: &mut AxApi, listed: &[ListedWindow]) {
+/// Resolves AX elements for the listed windows without holding a write lock on `AxApi`
+/// during cross-process Mach RPCs. Caller owns one retain on each returned element.
+pub fn discover_elements(
+    get_window: Option<unsafe extern "C" fn(*mut c_void, *mut u32) -> i32>,
+    listed: &[ListedWindow],
+) -> Vec<(u64, i32, *mut c_void)> {
     let mut by_pid: HashMap<i32, Vec<&ListedWindow>> = HashMap::new();
     for window in listed {
         by_pid.entry(window.pid).or_default().push(window);
     }
+    let mut found = Vec::new();
     for (pid, group) in by_pid {
-        let Some(app) = api.apps.get(&pid).map(|element| element.0).or_else(|| app_element(pid)) else {
+        let Some(app) = app_element(pid) else {
             continue;
         };
-        if let std::collections::hash_map::Entry::Vacant(slot) = api.apps.entry(pid) {
-            slot.insert(Element(app));
-        }
         let elements = copy_windows(app);
+        unsafe { cf_release(app) };
         for element in elements {
-            let matched = match_element(api, element, &group);
-            if let Some(id) = matched {
-                unsafe { api.remember(id, pid, element) };
+            if let Some(id) = match_element_with(get_window, element, &group) {
+                found.push((id, pid, element));
+            } else {
+                unsafe { cf_release(element) };
             }
-            unsafe { cf_release(element) };
+        }
+    }
+    found
+}
+
+/// Resolves AX elements for the listed windows. Falls back to pid + bounds.
+pub fn resolve_elements(api: &mut AxApi, listed: &[ListedWindow]) {
+    let discovered = discover_elements(api.get_window, listed);
+    for (id, pid, element) in discovered {
+        unsafe {
+            api.remember(id, pid, element);
+            cf_release(element);
         }
     }
 }
 
-fn match_element(api: &AxApi, element: *mut c_void, group: &[&ListedWindow]) -> Option<u64> {
-    if let Some(get_window) = api.get_window {
+fn match_element_with(
+    get_window: Option<unsafe extern "C" fn(*mut c_void, *mut u32) -> i32>,
+    element: *mut c_void,
+    group: &[&ListedWindow],
+) -> Option<u64> {
+    if let Some(get_window) = get_window {
         let mut id = 0u32;
         let err = unsafe { get_window(element, &mut id) };
         if err == 0 {
@@ -503,6 +540,45 @@ fn match_element(api: &AxApi, element: *mut c_void, group: &[&ListedWindow]) -> 
     }
     let matched: Vec<u64> = group.iter().filter(|window| window.title == title).map(|window| window.id).collect();
     if matched.len() == 1 { Some(matched[0]) } else { None }
+}
+
+unsafe fn create_observer(pid: i32, app: *mut c_void) -> Option<*mut c_void> {
+    let main_loop = crate::hotkeys::main_loop();
+    if main_loop.is_null() || pid <= 0 {
+        return None;
+    }
+    let mut observer: *mut c_void = std::ptr::null_mut();
+    if AXObserverCreate(pid, ax_observer_callback, &mut observer) != 0 || observer.is_null() {
+        return None;
+    }
+    let source = AXObserverGetRunLoopSource(observer);
+    if source.is_null() {
+        cf_release(observer);
+        return None;
+    }
+    CFRunLoopAddSource(main_loop, source, kCFRunLoopCommonModes);
+    for name in [
+        "AXWindowCreated",
+        "AXUIElementDestroyed",
+        "AXWindowMiniaturized",
+        "AXWindowDeminiaturized",
+        "AXApplicationHidden",
+        "AXApplicationShown",
+    ] {
+        let cf = cf_string(name);
+        let _ = AXObserverAddNotification(observer, app, cf, std::ptr::null_mut());
+        cf_release(cf);
+    }
+    Some(observer)
+}
+
+extern "C" fn ax_observer_callback(
+    _observer: *mut c_void,
+    _element: *mut c_void,
+    _notification: *const c_void,
+    _refcon: *mut c_void,
+) {
+    crate::wake::note_ax_window_event();
 }
 
 fn app_element(pid: i32) -> Option<*mut c_void> {
@@ -535,7 +611,10 @@ fn copy_windows(app: *mut c_void) -> Vec<*mut c_void> {
 }
 
 unsafe fn set_size(element: *mut c_void, width: f64, height: f64) {
-    let size = CgSize { width, height };
+    let size = CgSize {
+        width: width.round(),
+        height: height.round(),
+    };
     let value = AXValueCreate(AX_SIZE, (&size as *const CgSize).cast());
     if value.is_null() {
         return;
@@ -545,7 +624,10 @@ unsafe fn set_size(element: *mut c_void, width: f64, height: f64) {
 }
 
 unsafe fn set_position(element: *mut c_void, x: f64, y: f64) {
-    let point = CgPoint { x, y };
+    let point = CgPoint {
+        x: x.round(),
+        y: y.round(),
+    };
     let value = AXValueCreate(AX_POINT, (&point as *const CgPoint).cast());
     if value.is_null() {
         return;
@@ -796,6 +878,14 @@ unsafe fn cf_release(value: *const c_void) {
     }
 }
 
+/// Releases a retained AX element returned by [`discover_elements`].
+///
+/// # Safety
+/// `element` must be a valid CFTypeRef or null.
+pub unsafe fn release_element(element: *mut c_void) {
+    unsafe { cf_release(element) };
+}
+
 extern "C" {
     fn AXIsProcessTrusted() -> u8;
     fn AXUIElementCreateApplication(pid: i32) -> *mut c_void;
@@ -804,6 +894,20 @@ extern "C" {
     fn AXUIElementSetMessagingTimeout(element: *mut c_void, timeout: f32) -> i32;
     fn AXUIElementIsAttributeSettable(element: *mut c_void, attribute: *const c_void, settable: *mut u8) -> i32;
     fn AXUIElementPerformAction(element: *mut c_void, action: *const c_void) -> i32;
+    fn AXObserverCreate(
+        application: i32,
+        callback: extern "C" fn(*mut c_void, *mut c_void, *const c_void, *mut c_void),
+        out_observer: *mut *mut c_void,
+    ) -> i32;
+    fn AXObserverGetRunLoopSource(observer: *mut c_void) -> *mut c_void;
+    fn AXObserverAddNotification(
+        observer: *mut c_void,
+        element: *mut c_void,
+        notification: *const c_void,
+        refcon: *mut c_void,
+    ) -> i32;
+    fn CFRunLoopAddSource(run_loop: *mut c_void, source: *mut c_void, mode: *const c_void);
+    static kCFRunLoopCommonModes: *const c_void;
     fn CGWarpMouseCursorPosition(point: CgPoint) -> i32;
     fn AXValueCreate(kind: u32, value: *const c_void) -> *const c_void;
     fn AXValueGetValue(value: *mut c_void, kind: u32, out: *mut c_void) -> u8;

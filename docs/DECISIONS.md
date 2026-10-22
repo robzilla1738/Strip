@@ -223,3 +223,9 @@ trackpad, and each gesture frame is read inside its own autorelease pool because
 the tap runs outside AppKit's event loop. A swipe scrolls the display under the
 pointer. `scripts/shortcuts.sh` presses every default shortcut as a real key
 event and checks the result.
+
+## Gap-aware column sizing and smooth swipe/animation pacing
+
+Column widths inside a scrollable viewport of width `vw` (`visible.width - 2 * gap_outer` minus pins) are computed as `ratio * (vw + gap_inner) - gap_inner`, so a `1.0` column equals `vw` and any combination of preset ratios summing to `<= 1.0` (`0.5 + 0.5`, `0.25 + 0.75`, `0.25 × 4`) fits inside the viewport together with its inner gaps without overhanging the screen edge or shifting on focus changes.
+
+Interleaved AppKit `NSEventTypeGesture` sub-events with empty `allTouches` sets are ignored so they never clear active finger anchors mid-swipe, and touch identities are matched by `-[NSObject hash]`. `CVDisplayLink` emits its first VSync slice immediately and signals the main run-loop `CFRunLoopSource` on wake so no frame is dropped between run-loop turns. `AXEnhancedUserInterface = false` is cached per pid, and element discovery runs outside the `AxApi` write lock so animation writers never block on window enumeration.

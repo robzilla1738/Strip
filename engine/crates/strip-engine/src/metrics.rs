@@ -24,10 +24,15 @@ pub struct Metrics {
 
 impl Metrics {
     pub fn record_write(&mut self, bundle_id: &str, elapsed_ms: f64) {
-        self.writes
-            .entry(bundle_id.to_string())
-            .or_default()
-            .push(elapsed_ms);
+        // Percentiles only need a recent window; an unbounded history makes
+        // every metrics snapshot (taken per animation frame) slower all day.
+        const KEEP: usize = 512;
+        let samples = self.writes.entry(bundle_id.to_string()).or_default();
+        samples.push(elapsed_ms);
+        if samples.len() > KEEP {
+            let extra = samples.len() - KEEP;
+            samples.drain(0..extra);
+        }
     }
 
     pub fn record_frame(&mut self, interval_ms: f64) {

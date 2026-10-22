@@ -14,6 +14,19 @@ pub struct EnhancedGuard {
 }
 
 impl EnhancedGuard {
+    /// True when `pid` has not been checked yet (or was restored and needs
+    /// to be disabled again before the next burst of writes).
+    pub fn needs_check(&self, pid: i32) -> bool {
+        !self.restore.contains_key(&pid)
+    }
+
+    pub fn record_initial(&mut self, pid: i32, enabled: bool, now: Instant) {
+        self.restore.entry(pid).or_insert(enabled);
+        if enabled {
+            self.last_write.insert(pid, now);
+        }
+    }
+
     /// Reads the attribute once per burst of writes. A pid whose attribute was
     /// already off is remembered as `false` so later writes skip the AX read.
     pub fn before_write<A: WindowApi + ?Sized>(&mut self, api: &A, pid: i32, now: Instant) {
@@ -24,25 +37,38 @@ impl EnhancedGuard {
             }
             slot.insert(enabled);
         }
-        self.last_write.insert(pid, now);
+        if self.restore.get(&pid).copied().unwrap_or(false) {
+            self.last_write.insert(pid, now);
+        }
     }
 
     pub fn note_write(&mut self, pid: i32, now: Instant) {
-        self.last_write.insert(pid, now);
+        if self.restore.get(&pid).copied().unwrap_or(false) {
+            self.last_write.insert(pid, now);
+        }
     }
 
-    pub fn restore_due<A: WindowApi + ?Sized>(&mut self, api: &A, now: Instant) {
+    pub fn take_due(&mut self, now: Instant) -> Vec<i32> {
         let due: Vec<i32> = self
             .last_write
             .iter()
             .filter(|(_, then)| now.saturating_duration_since(**then) >= RESTORE_AFTER)
             .map(|(pid, _)| *pid)
             .collect();
+        let mut to_restore = Vec::new();
         for pid in due {
             self.last_write.remove(&pid);
-            if self.restore.remove(&pid).unwrap_or(false) {
-                api.set_enhanced_ui(pid, true);
+            if self.restore.get(&pid).copied().unwrap_or(false) {
+                self.restore.remove(&pid);
+                to_restore.push(pid);
             }
+        }
+        to_restore
+    }
+
+    pub fn restore_due<A: WindowApi + ?Sized>(&mut self, api: &A, now: Instant) {
+        for pid in self.take_due(now) {
+            api.set_enhanced_ui(pid, true);
         }
     }
 }

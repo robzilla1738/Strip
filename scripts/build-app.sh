@@ -29,5 +29,6 @@ xcodebuild \
   -scheme Strip \
   -configuration Debug \
   -destination 'platform=macOS,arch=arm64' \
+  -derivedDataPath "$root/build/DerivedData" \
   "${signing[@]}" \
   build

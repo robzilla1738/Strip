@@ -15,6 +15,7 @@ use crate::hotkeys;
 
 static REQUESTED: AtomicBool = AtomicBool::new(false);
 static SPACE_CHANGED: AtomicBool = AtomicBool::new(false);
+static WORKSPACE_CHANGED: AtomicBool = AtomicBool::new(false);
 static INSTALLED: AtomicBool = AtomicBool::new(false);
 
 const DISTRIBUTED: &[&str] = &["com.apple.screenIsUnlocked", "com.apple.screenIsLocked"];
@@ -25,6 +26,13 @@ const WORKSPACE_WAKE: &[&str] = &[
 ];
 
 const WORKSPACE_SPACE: &[&str] = &["NSWorkspaceActiveSpaceDidChangeNotification"];
+
+const WORKSPACE_APPS: &[&str] = &[
+    "NSWorkspaceDidLaunchApplicationNotification",
+    "NSWorkspaceDidTerminateApplicationNotification",
+    "NSWorkspaceDidHideApplicationNotification",
+    "NSWorkspaceDidUnhideApplicationNotification",
+];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NoticeCenter {
@@ -67,17 +75,28 @@ pub fn install() {
         }
         for name in WORKSPACE_WAKE {
             debug_assert_eq!(notice_center(name), NoticeCenter::Workspace);
-            observe_workspace(name, false);
+            observe_workspace(name, WorkspaceKind::Wake);
         }
         for name in WORKSPACE_SPACE {
             debug_assert_eq!(notice_center(name), NoticeCenter::Workspace);
-            observe_workspace(name, true);
+            observe_workspace(name, WorkspaceKind::Space);
+        }
+        for name in WORKSPACE_APPS {
+            debug_assert_eq!(notice_center(name), NoticeCenter::Workspace);
+            observe_workspace(name, WorkspaceKind::Apps);
         }
         let _ = CGDisplayRegisterReconfigurationCallback(display_callback, std::ptr::null_mut());
     }
 }
 
-fn observe_workspace(name: &str, space_change: bool) {
+#[derive(Clone, Copy)]
+enum WorkspaceKind {
+    Wake,
+    Space,
+    Apps,
+}
+
+fn observe_workspace(name: &str, kind: WorkspaceKind) {
     unsafe {
         let workspace: id = msg_send![class!(NSWorkspace), sharedWorkspace];
         if workspace.is_null() {
@@ -89,10 +108,10 @@ fn observe_workspace(name: &str, space_change: bool) {
         }
         let label = NSString::alloc(nil).init_str(name);
         let block = block::ConcreteBlock::new(move |_note: id| {
-            if space_change {
-                SPACE_CHANGED.store(true, Ordering::SeqCst);
-            } else {
-                REQUESTED.store(true, Ordering::SeqCst);
+            match kind {
+                WorkspaceKind::Wake => REQUESTED.store(true, Ordering::SeqCst),
+                WorkspaceKind::Space => SPACE_CHANGED.store(true, Ordering::SeqCst),
+                WorkspaceKind::Apps => WORKSPACE_CHANGED.store(true, Ordering::SeqCst),
             }
             hotkeys::wake_main();
         });
@@ -102,12 +121,21 @@ fn observe_workspace(name: &str, space_change: bool) {
     }
 }
 
+pub fn note_ax_window_event() {
+    WORKSPACE_CHANGED.store(true, Ordering::SeqCst);
+    hotkeys::wake_main();
+}
+
 pub fn take_request() -> bool {
     REQUESTED.swap(false, Ordering::SeqCst)
 }
 
 pub fn take_space_change() -> bool {
     SPACE_CHANGED.swap(false, Ordering::SeqCst)
+}
+
+pub fn take_workspace_change() -> bool {
+    WORKSPACE_CHANGED.swap(false, Ordering::SeqCst)
 }
 
 extern "C" fn wake_callback(

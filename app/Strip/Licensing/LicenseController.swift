@@ -63,12 +63,18 @@ struct LicenseEnvironment {
     var machineName: String
     var baseURL: URL?
     var checkoutURL: String
+
+    /// False in local/dev builds where the brand values (payment env,
+    /// products, checkout) were never filled in. There is nothing to buy or
+    /// activate against, so licensing must not gate the app.
+    var configured: Bool { baseURL != nil }
 }
 
 enum LicensePhase: Equatable {
     case trial(daysLeft: Int)
     case licensed(maskedKey: String, productID: String)
     case unlicensed(message: String)
+    case notConfigured
 
     var allowsManaging: Bool {
         if case .unlicensed = self { return false }
@@ -81,6 +87,7 @@ enum LicensePhase: Equatable {
         case .licensed: return "Licensed"
         case .unlicensed(let message):
             return message.isEmpty ? "License required" : message
+        case .notConfigured: return "Not configured (dev build)"
         }
     }
 }
@@ -112,6 +119,9 @@ final class LicenseController: ObservableObject {
         self.environment = environment
         self.store = store
         self.session = session
+        if !environment.configured {
+            phase = .notConfigured
+        }
     }
 
     static func live() -> LicenseController {
@@ -153,6 +163,10 @@ final class LicenseController: ObservableObject {
     }
 
     func refresh(now: Date) {
+        guard environment.configured else {
+            setPhase(.notConfigured)
+            return
+        }
         if loadLicense() != nil {
             validate(now: now)
         } else {
@@ -242,6 +256,10 @@ final class LicenseController: ObservableObject {
     }
 
     private func applyTrial(now: Date) {
+        guard environment.configured else {
+            setPhase(.notConfigured)
+            return
+        }
         guard environment.trialDays > 0 else {
             setPhase(.unlicensed(message: "License required"))
             return

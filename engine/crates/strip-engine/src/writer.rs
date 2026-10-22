@@ -166,8 +166,14 @@ impl<A: WindowApi + 'static> WriterPool<A> {
 
     pub fn poll_enhanced_ui(&self) {
         let now = self.shared.clock.now();
+        let due = lock(&self.shared.guard).take_due(now);
+        if due.is_empty() {
+            return;
+        }
         let api = self.shared.api.read().unwrap_or_else(|err| err.into_inner());
-        lock(&self.shared.guard).restore_due(&*api, now);
+        for pid in due {
+            api.set_enhanced_ui(pid, true);
+        }
     }
 
     pub fn commits(&self) -> u64 {
@@ -317,6 +323,13 @@ fn worker_loop<A: WindowApi>(pid: i32, state: Arc<WorkerState>, shared: Arc<Shar
             continue;
         }
         drop(guard);
+        // Position ticks first: one slow resize (tens of ms on Chromium-class
+        // apps) must not delay the visible motion of every other window.
+        let mut pending = pending;
+        pending.sort_by_key(|item| {
+            let seen_size = applied_size.get(&item.window).copied().unwrap_or(0);
+            item.size_generation != seen_size && !item.animation_frame
+        });
         for item in pending {
             let latest = **item.slot.load();
             let generation = latest.generation.max(item.generation);
@@ -353,7 +366,16 @@ fn apply_one<A: WindowApi>(
     let started = Instant::now();
     let read_back = {
         let api = shared.api.read().unwrap_or_else(|err| err.into_inner());
-        lock(&shared.guard).before_write(&*api, pid, shared.clock.now());
+        let needs_check = lock(&shared.guard).needs_check(pid);
+        if needs_check {
+            let enabled = api.enhanced_ui(pid);
+            if enabled {
+                api.set_enhanced_ui(pid, false);
+            }
+            lock(&shared.guard).record_initial(pid, enabled, shared.clock.now());
+        } else {
+            lock(&shared.guard).note_write(pid, shared.clock.now());
+        }
         let read_back = if write_size {
             write_resize_move(&*api, window, frame);
             api.read_frame(window)
@@ -378,6 +400,9 @@ fn apply_one<A: WindowApi>(
     lock(&shared.last_frames).insert(window, frame);
     shared.commits.fetch_add(1, Ordering::SeqCst);
     let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
+    if elapsed_ms > 20.0 && std::env::var_os("STRIP_SLOW_LOG").is_some() {
+        eprintln!("slow-write bundle={bundle} window={window} size={write_size} ms={elapsed_ms:.1}");
+    }
     lock(&shared.metrics).record_write(bundle, elapsed_ms);
 }
 
@@ -411,6 +436,50 @@ mod tests {
             width: 400.0,
             height: 300.0,
         }
+    }
+
+    #[test]
+    fn position_ticks_jump_ahead_of_pending_resizes() {
+        let calls = Arc::new(Mutex::new(Vec::<(&'static str, u64)>::new()));
+        let sizes = calls.clone();
+        let positions = calls.clone();
+        let mut api = MockApi::new();
+        api.expect_write_size().returning(move |window, _, _| {
+            sizes
+                .lock()
+                .unwrap_or_else(|err| err.into_inner())
+                .push(("size", window));
+            if window == 1 {
+                thread::sleep(Duration::from_millis(60));
+            }
+        });
+        api.expect_write_position().returning(move |window, _, _| {
+            positions
+                .lock()
+                .unwrap_or_else(|err| err.into_inner())
+                .push(("pos", window));
+        });
+        api.expect_read_frame().returning(|_| frame(0.0));
+        api.expect_enhanced_ui().returning(|_| false);
+        api.expect_set_enhanced_ui().returning(|_, _| {});
+
+        let mut pool = WriterPool::new(api, Arc::new(SystemClock));
+        pool.publish(9, 1, frame(0.0), "com.example.Order");
+        thread::sleep(Duration::from_millis(10));
+        // Both land while the worker is inside window 1's slow resize.
+        pool.publish(9, 2, frame(10.0), "com.example.Order");
+        pool.publish_position(9, 3, frame(20.0), "com.example.Order");
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !pool.is_idle() || pool.commits() < 3 {
+            assert!(Instant::now() < deadline, "writer did not finish");
+            thread::sleep(Duration::from_millis(5));
+        }
+        thread::sleep(Duration::from_millis(30));
+        pool.shutdown();
+        let calls = calls.lock().unwrap_or_else(|err| err.into_inner());
+        let pos3 = calls.iter().position(|call| *call == ("pos", 3)).expect("position tick written");
+        let size2 = calls.iter().position(|call| *call == ("size", 2)).expect("resize written");
+        assert!(pos3 < size2, "calls = {calls:?}");
     }
 
     #[test]

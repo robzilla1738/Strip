@@ -8,6 +8,7 @@ strip_root() {
 strip_load_developer_dir() {
   local root
   root="$(strip_root)"
+  export PATH="/opt/homebrew/opt/rustup/bin:/opt/homebrew/bin:/usr/local/bin:$HOME/.cargo/bin:$PATH"
   if [[ -f "$root/config/developer.env" ]]; then
     # shellcheck disable=SC1091
     source "$root/config/developer.env"

@@ -147,6 +147,9 @@ impl Strip {
             }
         }
         if pid != frontmost_pid {
+            if self.focus == Focus::None {
+                self.focus = Focus::Column(index);
+            }
             return;
         }
         self.focus = Focus::Column(index);

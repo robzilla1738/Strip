@@ -51,41 +51,114 @@ struct Frame {
 
 /// A touch that lands once the swipe is armed (a resting thumb or palm) joins
 /// the stream instead of restarting it, so the strip never stops mid-swipe.
+/// Likewise one finger lifting early (fingers rarely leave together) ends
+/// nothing: the swipe ends when the event ends or no touch remains down.
 fn step_anchors(anchors: &mut Vec<Anchor>, frame: &Frame, armed: bool) -> (f64, f64, &'static str) {
-    let ended = frame.event_ended || frame.fingers_detail.iter().any(|finger| finger.ended);
-    let landed = frame.fingers_detail.len() != anchors.len() || frame.fingers_detail.iter().any(|finger| finger.began);
-    let began = anchors.is_empty() || (!armed && landed);
-    if began && !ended {
-        *anchors = frame
-            .fingers_detail
-            .iter()
-            .map(|finger| Anchor { id: finger.id, x: finger.x, y: finger.y })
-            .collect();
-        return (0.0, 0.0, "began");
-    }
+    let active: Vec<&Finger> = frame.fingers_detail.iter().filter(|finger| !finger.ended).collect();
+    let ended = frame.event_ended || (!frame.fingers_detail.is_empty() && (active.is_empty() || (armed && active.len() <= 1)));
     if ended {
         anchors.clear();
         return (0.0, 0.0, "ended");
     }
-    let mut sum_x = 0.0;
-    let mut sum_y = 0.0;
-    let mut matched = 0.0;
-    for finger in &frame.fingers_detail {
+    // AppKit interleaves gesture sub-events whose touch set is empty between
+    // real touch samples; they must not clear anchors or restart the swipe.
+    if active.is_empty() {
+        return (0.0, 0.0, "moved");
+    }
+    let landed = active.iter().any(|finger| finger.began || !anchors.iter().any(|anchor| anchor.id == finger.id));
+    let began = anchors.is_empty() || (!armed && (landed || active.len() > anchors.len()));
+    if began {
+        *anchors = active.iter().map(|finger| Anchor { id: finger.id, x: finger.x, y: finger.y }).collect();
+        return (0.0, 0.0, "began");
+    }
+    // Median across fingers: one noisy finger cannot jitter the strip.
+    let mut deltas_x: Vec<f64> = Vec::with_capacity(active.len());
+    let mut deltas_y: Vec<f64> = Vec::with_capacity(active.len());
+    for finger in &active {
         if let Some(anchor) = anchors.iter().find(|anchor| anchor.id == finger.id) {
-            sum_x += finger.x - anchor.x;
-            sum_y += finger.y - anchor.y;
-            matched += 1.0;
+            deltas_x.push(finger.x - anchor.x);
+            deltas_y.push(finger.y - anchor.y);
         }
     }
-    *anchors = frame
-        .fingers_detail
-        .iter()
-        .map(|finger| Anchor { id: finger.id, x: finger.x, y: finger.y })
-        .collect();
-    if matched == 0.0 {
-        (0.0, 0.0, "moved")
+    *anchors = active.iter().map(|finger| Anchor { id: finger.id, x: finger.x, y: finger.y }).collect();
+    (median(&mut deltas_x), median(&mut deltas_y), "moved")
+}
+
+fn median(values: &mut [f64]) -> f64 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    values.sort_by(|a, b| a.total_cmp(b));
+    let mid = values.len() / 2;
+    if values.len() % 2 == 1 {
+        values[mid]
     } else {
-        (sum_x / matched, sum_y / matched, "moved")
+        (values[mid - 1] + values[mid]) / 2.0
+    }
+}
+
+/// The tap runs outside AppKit's event loop, so nothing drains autoreleased
+/// objects for us; each gesture frame gets its own pool.
+fn read_frame(event: *mut c_void) -> Option<Frame> {
+    unsafe {
+        let pool: id = msg_send![class!(NSAutoreleasePool), new];
+        let frame = read_frame_in_pool(event);
+        let _: () = msg_send![pool, drain];
+        frame
+    }
+}
+
+unsafe fn read_frame_in_pool(event: *mut c_void) -> Option<Frame> {
+    unsafe {
+        let ns_event: id = msg_send![class!(NSEvent), eventWithCGEvent: event];
+        if ns_event.is_null() {
+            return None;
+        }
+        let kind: usize = msg_send![ns_event, type];
+        if kind != GESTURE as usize {
+            return None;
+        }
+        let event_phase: usize = msg_send![ns_event, phase];
+        let event_ended = event_phase & (8 | 16) != 0;
+        let touches: id = msg_send![ns_event, allTouches];
+        if touches.is_null() {
+            return event_ended.then_some(Frame {
+                fingers: 0,
+                fingers_detail: Vec::new(),
+                event_ended: true,
+            });
+        }
+        let count: usize = msg_send![touches, count];
+        let objects: id = msg_send![touches, allObjects];
+        let mut fingers_detail = Vec::with_capacity(count);
+        if !objects.is_null() {
+            for index in 0..count {
+                let touch: id = msg_send![objects, objectAtIndex: index];
+                if touch.is_null() {
+                    continue;
+                }
+                let point: NSPoint = msg_send![touch, normalizedPosition];
+                let phase: usize = msg_send![touch, phase];
+                let identity: id = msg_send![touch, identity];
+                let id_hash: usize = if identity.is_null() { index } else { msg_send![identity, hash] };
+                fingers_detail.push(Finger {
+                    id: id_hash as u64,
+                    x: point.x,
+                    y: point.y,
+                    began: phase == 1,
+                    ended: phase == 8 || phase == 16,
+                });
+            }
+        }
+        if !event_ended && fingers_detail.is_empty() {
+            return None;
+        }
+        let active_count = fingers_detail.iter().filter(|finger| !finger.ended).count();
+        Some(Frame {
+            fingers: active_count.min(255) as u8,
+            fingers_detail,
+            event_ended,
+        })
     }
 }
 
@@ -114,62 +187,24 @@ mod tests {
     }
 
     #[test]
+    fn one_finger_lifting_early_does_not_end_the_swipe() {
+        let mut anchors = Vec::new();
+        step_anchors(&mut anchors, &frame((1..=4).map(|id| finger(id, 0.5, true)).collect()), false);
+        let mut lifting: Vec<Finger> = (1..=3).map(|id| finger(id, 0.4, false)).collect();
+        lifting.push(Finger { ended: true, ..finger(4, 0.4, false) });
+        let (dx, _, phase) = step_anchors(&mut anchors, &frame(lifting), true);
+        assert_eq!(phase, "moved");
+        assert!((dx + 0.1).abs() < 1e-9, "dx {dx}");
+        let all_up: Vec<Finger> = (1..=3).map(|id| Finger { ended: true, ..finger(id, 0.4, false) }).collect();
+        assert_eq!(step_anchors(&mut anchors, &frame(all_up), true).2, "ended");
+    }
+
+    #[test]
     fn a_touch_landing_before_arming_restarts() {
         let mut anchors = Vec::new();
         step_anchors(&mut anchors, &frame((1..=3).map(|id| finger(id, 0.5, true)).collect()), false);
         let mut more: Vec<Finger> = (1..=3).map(|id| finger(id, 0.5, false)).collect();
         more.push(finger(4, 0.5, true));
         assert_eq!(step_anchors(&mut anchors, &frame(more), false).2, "began");
-    }
-}
-
-/// The tap runs outside AppKit's event loop, so nothing drains autoreleased
-/// objects for us; each gesture frame gets its own pool.
-fn read_frame(event: *mut c_void) -> Option<Frame> {
-    unsafe {
-        let pool: id = msg_send![class!(NSAutoreleasePool), new];
-        let frame = read_frame_in_pool(event);
-        let _: () = msg_send![pool, drain];
-        frame
-    }
-}
-
-unsafe fn read_frame_in_pool(event: *mut c_void) -> Option<Frame> {
-    unsafe {
-        let ns_event: id = msg_send![class!(NSEvent), eventWithCGEvent: event];
-        if ns_event.is_null() {
-            return None;
-        }
-        let event_phase: usize = msg_send![ns_event, phase];
-        let touches: id = msg_send![ns_event, allTouches];
-        if touches.is_null() {
-            return None;
-        }
-        let count: usize = msg_send![touches, count];
-        let objects: id = msg_send![touches, allObjects];
-        let mut fingers_detail = Vec::with_capacity(count);
-        if !objects.is_null() {
-            for index in 0..count {
-                let touch: id = msg_send![objects, objectAtIndex: index];
-                if touch.is_null() {
-                    continue;
-                }
-                let point: NSPoint = msg_send![touch, normalizedPosition];
-                let phase: usize = msg_send![touch, phase];
-                let identity: id = msg_send![touch, identity];
-                fingers_detail.push(Finger {
-                    id: identity as u64,
-                    x: point.x,
-                    y: point.y,
-                    began: phase == 1,
-                    ended: phase == 8 || phase == 16,
-                });
-            }
-        }
-        Some(Frame {
-            fingers: fingers_detail.len().min(255) as u8,
-            fingers_detail,
-            event_ended: event_phase & (8 | 16) != 0,
-        })
     }
 }

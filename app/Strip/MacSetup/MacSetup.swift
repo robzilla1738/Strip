@@ -307,7 +307,14 @@ struct MacSetupList: View {
 
     private func refresh() {
         let fingers = model.settings?.document.swipeFingers ?? 4
-        checks = MacSetup.live(appTrusted: AXIsProcessTrusted(), engineTrusted: model.axTrusted == true, fingers: fingers)
+        let appTrusted = AXIsProcessTrusted()
+        let engineTrusted = model.axTrusted == true
+        DispatchQueue.global(qos: .utility).async {
+            let updated = MacSetup.live(appTrusted: appTrusted, engineTrusted: engineTrusted, fingers: fingers)
+            DispatchQueue.main.async {
+                checks = updated
+            }
+        }
     }
 
     private func quit(_ apps: [(name: String, bundleID: String)]) {

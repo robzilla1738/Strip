@@ -17,12 +17,12 @@ struct IndicatorTile: Equatable {
 }
 
 enum IndicatorArt {
-    static let tile: CGFloat = 44
-    static let gap: CGFloat = 8
-    static let pad: CGFloat = 10
-    static let panelRadius: CGFloat = 24
-    /// Concentric with the panel corner so the focused tile nests inside the pill.
-    static let tileRadius: CGFloat = panelRadius - pad
+    static let tile: CGFloat = 48
+    static let gap: CGFloat = 6
+    static let pad: CGFloat = 8
+    /// A true capsule, like the macOS 26 Dock and floating toolbars.
+    static var panelRadius: CGFloat { (pad * 2 + tile) / 2 }
+    static let tileRadius: CGFloat = 16
     static let focus = NSColor(srgbRed: 76.0 / 255.0, green: 141.0 / 255.0, blue: 1, alpha: 1)
     static let pinColor = NSColor(srgbRed: 1, green: 0.62, blue: 0.04, alpha: 1)
     static let idle = NSColor(white: 1, alpha: 0.10)
@@ -72,18 +72,38 @@ enum IndicatorArt {
         return rep
     }
 
+    /// Dock-style magnification falloff for the hovered tile and its neighbours.
+    static func hoverScale(index: Int, hovered: Int?) -> CGFloat {
+        guard let hovered else { return 1 }
+        let distance = CGFloat(abs(index - hovered))
+        guard distance < 2 else { return 1 }
+        return 1 + 0.16 * cos(distance / 2 * .pi / 2)
+    }
+
     /// Draws into a y-down context whose `NSGraphicsContext.current` wraps `context`.
     static func draw(
         _ tiles: [IndicatorTile],
         in context: CGContext,
         dark: Bool = true,
         lifted: Int? = nil,
+        hovered: Int? = nil,
         accent: NSColor = focus,
         icon: (IndicatorTile) -> NSImage? = { _ in nil }
     ) {
         let frames = frames(count: tiles.count)
         for (index, tile) in tiles.enumerated() where index != lifted {
-            drawTile(tile, frame: frames[index], in: context, dark: dark, accent: accent, icon: icon(tile))
+            let frame = frames[index]
+            let scale = hoverScale(index: index, hovered: hovered)
+            if scale == 1 {
+                drawTile(tile, frame: frame, in: context, dark: dark, accent: accent, icon: icon(tile))
+                continue
+            }
+            context.saveGState()
+            context.translateBy(x: frame.midX, y: frame.midY)
+            context.scaleBy(x: scale, y: scale)
+            context.translateBy(x: -frame.midX, y: -frame.midY)
+            drawTile(tile, frame: frame, in: context, dark: dark, accent: accent, icon: icon(tile))
+            context.restoreGState()
         }
         guard let lifted, tiles.indices.contains(lifted) else { return }
         let frame = frames[lifted]
@@ -110,9 +130,9 @@ enum IndicatorArt {
         }
         if let icon {
             context.saveGState()
-            context.setShadow(offset: CGSize(width: 0, height: -1.5), blur: 4, color: NSColor(white: 0, alpha: dark ? 0.4 : 0.22).cgColor)
+            context.setShadow(offset: CGSize(width: 0, height: -1), blur: 3, color: NSColor(white: 0, alpha: dark ? 0.35 : 0.18).cgColor)
             icon.draw(
-                in: frame.insetBy(dx: 4, dy: 4),
+                in: frame.insetBy(dx: 6, dy: 6),
                 from: .zero,
                 operation: .sourceOver,
                 fraction: 1,
@@ -131,23 +151,25 @@ enum IndicatorArt {
         }
     }
 
-    /// An accent fill with a lighter top, a soft accent glow beneath, and a specular rim that
-    /// fades from the top edge, so the focused column reads as a lit piece of glass.
+    /// The focused column sits on a raised piece of clear glass — a bright
+    /// neutral pill with a specular rim and soft shadow, like a selected
+    /// segment in macOS 26 — marked by an accent dot beneath, Dock-style.
     private static func drawLitTile(_ shape: CGPath, frame: CGRect, in context: CGContext, dark: Bool, accent: NSColor) {
         let space = CGColorSpace(name: CGColorSpace.sRGB)
         context.saveGState()
-        context.setShadow(offset: CGSize(width: 0, height: -2), blur: 10, color: accent.withAlphaComponent(dark ? 0.55 : 0.4).cgColor)
+        context.setShadow(offset: CGSize(width: 0, height: -2), blur: 8, color: NSColor(white: 0, alpha: dark ? 0.45 : 0.25).cgColor)
         context.addPath(shape)
-        context.setFillColor(accent.cgColor)
+        context.setFillColor(NSColor(white: 1, alpha: dark ? 0.24 : 0.72).cgColor)
         context.fillPath()
         context.restoreGState()
 
         context.saveGState()
         context.addPath(shape)
         context.clip()
-        let top = accent.blended(withFraction: 0.28, of: .white) ?? accent
-        let bottom = accent.blended(withFraction: 0.08, of: .black) ?? accent
-        if let gradient = CGGradient(colorsSpace: space, colors: [top.cgColor, accent.cgColor, bottom.cgColor] as CFArray, locations: [0, 0.55, 1]) {
+        let top = NSColor(white: 1, alpha: dark ? 0.34 : 0.9)
+        let mid = (accent.blended(withFraction: dark ? 0.82 : 0.88, of: .white) ?? .white).withAlphaComponent(dark ? 0.28 : 0.75)
+        let bottom = NSColor(white: dark ? 1 : 0.92, alpha: dark ? 0.14 : 0.55)
+        if let gradient = CGGradient(colorsSpace: space, colors: [top.cgColor, mid.cgColor, bottom.cgColor] as CFArray, locations: [0, 0.5, 1]) {
             context.drawLinearGradient(gradient, start: CGPoint(x: frame.midX, y: frame.minY), end: CGPoint(x: frame.midX, y: frame.maxY), options: [])
         }
         context.restoreGState()
@@ -158,16 +180,20 @@ enum IndicatorArt {
         context.setLineWidth(1.5)
         context.replacePathWithStrokedPath()
         context.clip()
-        let shine = [NSColor(white: 1, alpha: 0.7).cgColor, NSColor(white: 1, alpha: 0.12).cgColor, NSColor(white: 1, alpha: 0.3).cgColor] as CFArray
+        let shine = [NSColor(white: 1, alpha: dark ? 0.85 : 0.95).cgColor, NSColor(white: 1, alpha: 0.15).cgColor, NSColor(white: 1, alpha: dark ? 0.4 : 0.5).cgColor] as CFArray
         if let gradient = CGGradient(colorsSpace: space, colors: shine, locations: [0, 0.6, 1]) {
             context.drawLinearGradient(gradient, start: CGPoint(x: frame.midX, y: frame.minY), end: CGPoint(x: frame.midX, y: frame.maxY), options: [])
         }
         context.restoreGState()
+
+        let dot: CGFloat = 5
+        context.setFillColor(accent.cgColor)
+        context.fillEllipse(in: CGRect(x: frame.midX - dot / 2, y: frame.maxY + (pad - dot) / 2, width: dot, height: dot))
     }
 
     private static func drawInitial(_ tile: IndicatorTile, frame: CGRect, dark: Bool) {
         guard let letter = tile.title.trimmingCharacters(in: .whitespaces).first else { return }
-        let color: NSColor = tile.focused ? .white : (dark ? NSColor(white: 1, alpha: 0.75) : NSColor(white: 0, alpha: 0.6))
+        let color: NSColor = tile.focused ? (dark ? .white : NSColor(white: 0, alpha: 0.85)) : (dark ? NSColor(white: 1, alpha: 0.75) : NSColor(white: 0, alpha: 0.6))
         let text = NSAttributedString(string: String(letter).uppercased(), attributes: [
             .font: NSFont.systemFont(ofSize: 19, weight: .semibold),
             .foregroundColor: color,
@@ -184,7 +210,7 @@ enum IndicatorArt {
     private static func drawCount(_ count: Int, focused: Bool, frame: CGRect, in context: CGContext, dark: Bool, accent: NSColor) {
         let text = NSAttributedString(string: count > 99 ? "99+" : "\(count)", attributes: [
             .font: NSFont.monospacedDigitSystemFont(ofSize: 10, weight: .bold),
-            .foregroundColor: focused ? (accent.blended(withFraction: 0.15, of: .black) ?? accent) : NSColor.white,
+            .foregroundColor: NSColor.white,
         ])
         let size = text.size()
         let height: CGFloat = 16
@@ -193,7 +219,7 @@ enum IndicatorArt {
         context.saveGState()
         badgeShadow(context)
         context.addPath(CGPath(roundedRect: badge, cornerWidth: height / 2, cornerHeight: height / 2, transform: nil))
-        context.setFillColor((focused ? NSColor.white : NSColor(white: dark ? 0.4 : 0.18, alpha: 0.95)).cgColor)
+        context.setFillColor((focused ? accent : NSColor(white: dark ? 0.4 : 0.18, alpha: 0.95)).cgColor)
         context.fillPath()
         context.restoreGState()
         text.draw(at: CGPoint(x: badge.midX - size.width / 2, y: badge.midY - size.height / 2))
@@ -285,13 +311,18 @@ final class AppIconCache {
     }
 }
 
-final class IndicatorTilesView: NSView {
+final class IndicatorTilesView: NSView, NSViewToolTipOwner {
     var tiles: [IndicatorTile] = [] {
         didSet {
             guard tiles != oldValue else { return }
             if dragFrom != nil, tiles.count != oldValue.count { endDrag() }
+            if hovered != nil, !tiles.indices.contains(hovered!) { hovered = nil }
+            refreshToolTips()
             needsDisplay = true
         }
+    }
+    private var hovered: Int? {
+        didSet { if hovered != oldValue { needsDisplay = true } }
     }
     var onFocus: ((IndicatorTile) -> Void)?
     var onMove: ((_ from: Int, _ to: Int) -> Void)?
@@ -309,6 +340,45 @@ final class IndicatorTilesView: NSView {
     override var isFlipped: Bool { true }
 
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        for area in trackingAreas { removeTrackingArea(area) }
+        addTrackingArea(NSTrackingArea(rect: bounds, options: [.mouseMoved, .mouseEnteredAndExited, .activeAlways], owner: self))
+    }
+
+    override func resetCursorRects() {
+        super.resetCursorRects()
+        addCursorRect(bounds, cursor: .pointingHand)
+    }
+
+    override func mouseMoved(with event: NSEvent) {
+        hovered = reduceMotion ? nil : hit(convert(event.locationInWindow, from: nil))
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        hovered = nil
+    }
+
+    private var reduceMotion: Bool {
+        NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+    }
+
+    private func refreshToolTips() {
+        removeAllToolTips()
+        for (index, frame) in IndicatorArt.frames(count: tiles.count).enumerated() {
+            _ = addToolTip(frame, owner: self, userData: UnsafeMutableRawPointer(bitPattern: index + 1))
+        }
+    }
+
+    func view(_ view: NSView, stringForToolTip tag: NSView.ToolTipTag, point: NSPoint, userData data: UnsafeMutableRawPointer?) -> String {
+        guard let data else { return "" }
+        let index = Int(bitPattern: data) - 1
+        guard tiles.indices.contains(index) else { return "" }
+        let tile = tiles[index]
+        let base = tile.title.isEmpty ? "Column \(index + 1)" : tile.title
+        return tile.count > 1 ? "\(base) — \(tile.count) windows" : base
+    }
 
     override func setFrameSize(_ newSize: NSSize) {
         let changed = newSize != frame.size
@@ -337,6 +407,7 @@ final class IndicatorTilesView: NSView {
             in: context,
             dark: dark,
             lifted: dragging ? dragTarget : nil,
+            hovered: dragging ? nil : hovered,
             accent: IndicatorArt.systemAccent,
             icon: { icons.icon(for: $0) }
         )

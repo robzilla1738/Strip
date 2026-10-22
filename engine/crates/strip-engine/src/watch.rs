@@ -128,17 +128,21 @@ pub fn take_dirty() -> bool {
     DIRTY.swap(false, Ordering::SeqCst)
 }
 
+/// Signals the main-loop source so a wakeup that lands before `CFRunLoopRunInMode`
+/// begins waiting still causes it to return immediately.
+pub fn signal_main_source() {
+    let source = SOURCE.load(Ordering::SeqCst);
+    if !source.is_null() {
+        unsafe {
+            CFRunLoopSourceSignal(source);
+        }
+    }
+}
+
 fn poke_reload() {
     DIRTY.store(true, Ordering::SeqCst);
-    let source = SOURCE.load(Ordering::SeqCst);
-    if source.is_null() {
-        crate::hotkeys::wake_main();
-        return;
-    }
-    unsafe {
-        CFRunLoopSourceSignal(source);
-        CFRunLoopWakeUp(CFRunLoopGetMain());
-    }
+    signal_main_source();
+    crate::hotkeys::wake_main();
 }
 
 pub fn install_reload_source() {
@@ -205,5 +209,4 @@ extern "C" {
     ) -> *mut c_void;
     fn CFRunLoopSourceSignal(source: *mut c_void);
     fn CFRunLoopStop(run_loop: *mut c_void);
-    fn CFRunLoopWakeUp(run_loop: *mut c_void);
 }

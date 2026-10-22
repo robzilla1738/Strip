@@ -9,8 +9,8 @@ mod spring;
 
 pub use gesture::{decay_velocity, rubber_band, snap_column, tracking_delta, Gesture, SwipeUpdate, SwipeView};
 pub use layout::{
-    column_width, crosses_display, scroll_width, layout, observe_size, overlap, parked_corner, sliver_used, Corner, Placement,
-    Side, SizeWatch, Visibility,
+    column_spans, column_width, column_width_in, crosses_display, layout, observe_size, overlap, parked_corner,
+    scroll_width, sliver_used, Corner, Placement, Side, SizeWatch, Visibility,
 };
 pub use model::{Column, ColumnId, DisplayMode, Focus, Pinned, Strip, Window, WindowId};
 pub use params::{DisplayFrame, Frame, LayoutParams, Viewport};

@@ -160,6 +160,7 @@ fn main() -> ExitCode {
         if wake::take_space_change() {
             runtime.switch_space();
         }
+        let _ = wake::take_workspace_change();
         if wake::take_request() {
             wake_at = Some(Instant::now() + WAKE_SETTLE);
         }
@@ -180,7 +181,8 @@ fn main() -> ExitCode {
         if let Some(due) = runtime.swipe_deadline() {
             deadline = wake_at.map_or(due, |wake| wake.min(due));
         }
-        let slice = deadline.saturating_duration_since(Instant::now()).as_secs_f64().min(1.0);
+        let max_slice = if runtime.is_animating() { 1.0 / 120.0 } else { 1.0 };
+        let slice = deadline.saturating_duration_since(Instant::now()).as_secs_f64().min(max_slice);
         hotkeys::pump(&mut runtime, &bus, slice);
         runtime.expire_swipe();
         runtime.drain_frames();
@@ -199,10 +201,22 @@ fn main() -> ExitCode {
             let response = dispatch(&mut runtime, &bus, job.message);
             let _ = job.reply.send(response);
         }
-        if Instant::now() >= next_tick && runtime.swipe_deadline().is_none() {
+        if runtime.swipe_deadline().is_some() {
+            let settle_due = Instant::now() + TICK_AFTER_SWIPE;
+            if next_tick < settle_due {
+                next_tick = settle_due;
+            }
+        } else if Instant::now() >= next_tick {
             runtime.tick();
             // Window discovery waits while the strip is in motion so frames stay on time.
-            next_tick = Instant::now() + if runtime.is_animating() { TICK_ANIMATING } else { TICK_IDLE };
+            next_tick = Instant::now()
+                + if runtime.has_pending_windows() {
+                    TICK_PENDING
+                } else if runtime.is_animating() {
+                    TICK_ANIMATING
+                } else {
+                    TICK_IDLE
+                };
         }
         command::flush_state(&runtime, &bus);
         persist.maybe_save(&runtime, &snapshot);
@@ -216,6 +230,8 @@ fn main() -> ExitCode {
 
 const TICK_IDLE: Duration = Duration::from_millis(1000);
 const TICK_ANIMATING: Duration = Duration::from_millis(600);
+const TICK_PENDING: Duration = Duration::from_millis(80);
+const TICK_AFTER_SWIPE: Duration = Duration::from_millis(150);
 const WAKE_SETTLE: Duration = Duration::from_millis(1500);
 const TAP_RETRY: Duration = Duration::from_secs(2);
 const PERSIST_EVERY: Duration = Duration::from_secs(2);

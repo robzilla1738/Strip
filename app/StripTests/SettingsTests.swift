@@ -30,6 +30,19 @@ final class SettingsTests: XCTestCase {
         XCTAssertFalse(ShortcutCodec.translated(4).isEmpty)
     }
 
+    func testShortcutHelpFormattingAndSymbols() {
+        XCTAssertEqual(ShortcutCodec.display("ctrl+alt-left"), "⌃⌥←")
+        XCTAssertEqual(ShortcutCodec.display("ctrl+alt-rightbracket"), "⌃⌥]")
+        XCTAssertEqual(ShortcutCodec.formattedKeys(for: "focus_index"), "⌃⌥1 … ⌃⌥9")
+        XCTAssertEqual(ShortcutCodec.title(for: "focus_left"), "Focus Left")
+        for group in ShortcutCodec.groups {
+            for action in group.1 {
+                XCTAssertFalse(ShortcutCodec.title(for: action).isEmpty)
+                XCTAssertFalse(ShortcutCodec.formattedKeys(for: action).isEmpty)
+            }
+        }
+    }
+
     func testTileFocusFollowsPinnedColumns() {
         XCTAssertTrue(tileIsFocused(focus: "pinned_left", focusedColumn: 0, pin: .left, column: -1))
         XCTAssertFalse(tileIsFocused(focus: "pinned_left", focusedColumn: 0, pin: nil, column: 0))
@@ -70,22 +83,29 @@ final class SettingsTests: XCTestCase {
         XCTAssertEqual(tiles.count, 5)
         XCTAssertEqual(IndicatorArt.frames(count: tiles.count).count, 5)
         let rep = IndicatorArt.render(tiles)
-        var focusPixels = 0
+        var pillPixels = 0
+        var accentPixels = 0
         var pinPixels = 0
         for y in 0..<rep.pixelsHigh {
             for x in 0..<rep.pixelsWide {
                 guard let color = rep.colorAt(x: x, y: y)?.usingColorSpace(.sRGB) else { continue }
+                let spread = max(color.redComponent, color.greenComponent, color.blueComponent) - min(color.redComponent, color.greenComponent, color.blueComponent)
+                if color.redComponent > 0.75, spread < 0.35, color.alphaComponent > 0.15, color.alphaComponent < 0.95 {
+                    pillPixels += 1
+                }
                 if color.blueComponent > 0.7, color.blueComponent > color.redComponent + 0.25, color.alphaComponent > 0.8 {
-                    focusPixels += 1
+                    accentPixels += 1
                 }
                 if color.redComponent > 0.85, color.greenComponent > 0.5, color.blueComponent < 0.5, color.alphaComponent > 0.8 {
                     pinPixels += 1
                 }
             }
         }
-        XCTAssertGreaterThan(focusPixels, 800, "focused tile should be the blue highlight")
+        XCTAssertGreaterThan(pillPixels, 800, "focused tile should sit on a bright glass pill")
+        XCTAssertLessThan(pillPixels, 2600, "only the focused tile is highlighted")
+        XCTAssertGreaterThan(accentPixels, 5, "focused tile should carry an accent dot")
+        XCTAssertLessThan(accentPixels, 300, "the accent is a dot and badge, not a filled tile")
         XCTAssertGreaterThan(pinPixels, 40, "pinned tiles should draw a pin glyph")
-        XCTAssertLessThan(focusPixels, 2000, "only the focused tile is highlighted")
     }
 
     private func engineBinary() throws -> URL {

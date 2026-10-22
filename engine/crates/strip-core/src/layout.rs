@@ -104,7 +104,14 @@ pub fn parked_corner(
 /// A window that keeps a wider size than its column gets a column that fits
 /// it, so the strip lays out around it instead of overlapping the neighbour.
 pub fn column_width(column: &crate::model::Column, viewport_width: f64) -> f64 {
-    let base = column.width_ratio * viewport_width;
+    column_width_in(column, viewport_width, 0.0)
+}
+
+/// Column width inside a scrollable viewport of width `scroll_width` with `gap_inner`
+/// between columns. Any set of ratios summing to `<= 1.0` fits inside `scroll_width`
+/// together with the inner gaps between them.
+pub fn column_width_in(column: &crate::model::Column, scroll_width: f64, gap_inner: f64) -> f64 {
+    let base = (column.width_ratio * (scroll_width + gap_inner) - gap_inner).max(1.0);
     column
         .windows
         .iter()
@@ -115,6 +122,12 @@ pub fn column_width(column: &crate::model::Column, viewport_width: f64) -> f64 {
 /// Width the columns scroll through: the viewport less outer gaps and pins.
 pub fn scroll_width(strip: &Strip, params: &LayoutParams, visible: Viewport) -> f64 {
     metrics(strip, params, visible).vw
+}
+
+/// `(prefix, width)` pairs for every scrollable column in `strip`.
+pub fn column_spans(strip: &Strip, params: &LayoutParams, visible: Viewport) -> Vec<(f64, f64)> {
+    let geom = metrics(strip, params, visible);
+    geom.prefixes.into_iter().zip(geom.widths).collect()
 }
 
 pub(crate) struct Metrics {
@@ -134,18 +147,18 @@ pub(crate) fn metrics(strip: &Strip, params: &LayoutParams, visible: Viewport) -
     let vy = visible.y + params.gap_outer;
     let mut vw = inner_w;
     if let Some(pin) = &strip.pinned_left {
-        let width = column_width(&pin.column, visible.width);
+        let width = column_width_in(&pin.column, inner_w, params.gap_inner);
         vx += width + params.gap_inner;
         vw = (vw - width - params.gap_inner).max(0.0);
     }
     if let Some(pin) = &strip.pinned_right {
-        let width = column_width(&pin.column, visible.width);
+        let width = column_width_in(&pin.column, inner_w, params.gap_inner);
         vw = (vw - width - params.gap_inner).max(0.0);
     }
     let widths: Vec<f64> = strip
         .columns
         .iter()
-        .map(|column| column_width(column, visible.width))
+        .map(|column| column_width_in(column, vw, params.gap_inner))
         .collect();
     let mut prefixes = Vec::with_capacity(widths.len());
     let mut cursor = 0.0;
@@ -174,6 +187,7 @@ pub fn layout(
     params: &LayoutParams,
 ) -> Vec<Placement> {
     let geom = metrics(strip, params, visible);
+    let inner_w = (visible.width - 2.0 * params.gap_outer).max(0.0);
     let view = Frame {
         x: geom.vx,
         y: geom.vy,
@@ -182,7 +196,7 @@ pub fn layout(
     };
     let mut placed = Vec::new();
     if let Some(pin) = &strip.pinned_left {
-        let frame = pin_frame(Side::Left, column_width(&pin.column, visible.width), visible, params);
+        let frame = pin_frame(Side::Left, column_width_in(&pin.column, inner_w, params.gap_inner), visible, params);
         place_column(&mut placed, &pin.column, frame, Visibility::Visible, Side::Left, display, params);
     }
     for (index, column) in strip.columns.iter().enumerate() {
@@ -202,7 +216,7 @@ pub fn layout(
         place_column(&mut placed, column, frame, visibility, side, display, params);
     }
     if let Some(pin) = &strip.pinned_right {
-        let frame = pin_frame(Side::Right, column_width(&pin.column, visible.width), visible, params);
+        let frame = pin_frame(Side::Right, column_width_in(&pin.column, inner_w, params.gap_inner), visible, params);
         place_column(&mut placed, &pin.column, frame, Visibility::Visible, Side::Right, display, params);
     }
     placed
@@ -563,5 +577,32 @@ mod tests {
         assert!((strip.columns[0].width_ratio - 0.4).abs() < 1e-9);
         assert!((strip.columns[1].width_ratio - 0.4).abs() < 1e-9);
         assert_eq!(strip.columns[1].windows[0].id, WindowId(2));
+    }
+
+    #[test]
+    fn two_half_width_columns_fit_inside_gapped_viewport_without_scrolling() {
+        let params = LayoutParams::standard();
+        let visible = Viewport { x: 0.0, y: 33.0, width: 1728.0, height: 1005.0 };
+        let display = DisplayFrame {
+            min_x: 0.0,
+            min_y: 0.0,
+            max_x: 1728.0,
+            max_y: 1117.0,
+            neighbour_left: false,
+            neighbour_right: false,
+        };
+        let mut strip = Strip::new();
+        strip.insert(Window::new(1, 1), 1, None, &params, visible);
+        strip.insert(Window::new(2, 1), 1, None, &params, visible);
+        assert!(strip.scroll_x.abs() < 1e-9, "scroll_x {}", strip.scroll_x);
+        strip.focus_left(&params, visible);
+        assert!(strip.scroll_x.abs() < 1e-9, "scroll_x {}", strip.scroll_x);
+        let placed = layout(&strip, visible, display, &params);
+        assert_eq!(placed.len(), 2);
+        assert_eq!(placed[0].visibility, Visibility::Visible);
+        assert_eq!(placed[1].visibility, Visibility::Visible);
+        assert!(!crosses_display(placed[0].frame, display));
+        assert!(!crosses_display(placed[1].frame, display));
+        assert!((placed[1].frame.right() - (visible.width - params.gap_outer)).abs() < 1e-6);
     }
 }

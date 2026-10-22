@@ -151,7 +151,16 @@ impl Inner {
     fn note(&self, host: u64) {
         let ns = host_to_ns(host);
         let previous = self.last_ns.swap(ns, Ordering::SeqCst);
-        if previous == 0 || ns <= previous {
+        if previous == 0 {
+            let refresh = f64::from_bits(self.refresh_ns.load(Ordering::SeqCst));
+            let ms = if refresh > 0.0 && refresh < 80.0 { refresh } else { 1000.0 / 120.0 };
+            let mut pending = self.pending_dt.lock().unwrap_or_else(|err| err.into_inner());
+            if pending.len() < 60 {
+                pending.push(ms / 1000.0);
+            }
+            return;
+        }
+        if ns <= previous {
             return;
         }
         let ms = (ns - previous) as f64 / 1_000_000.0;

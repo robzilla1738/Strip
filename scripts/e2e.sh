@@ -278,13 +278,15 @@ scroll_of() {
 view_w="$(query | jq -r '.displays[0].visible_frame[2]')"
 before_scroll="$(scroll_of)"
 "$CLI" --socket "$SOCKET" debug inject_gesture --fingers 4 --dx 0 --phase began
-"$CLI" --socket "$SOCKET" debug inject_gesture --fingers 4 --dx=-0.5 --phase moved
+# First move only crosses the recognition dead zone; tracking is measured from there.
+"$CLI" --socket "$SOCKET" debug inject_gesture --fingers 4 --dx=-0.02 --phase moved
+"$CLI" --socket "$SOCKET" debug inject_gesture --fingers 4 --dx=-0.48 --phase moved
 moved_scroll="$(scroll_of)"
 python3 -c '
 import sys
 before, moved, width = map(float, sys.argv[1:])
 delta = moved - before
-expected = 0.5 * 1.5 * width  # default swipe_sensitivity
+expected = 0.48 * 1.5 * width  # default swipe_sensitivity
 if abs(delta - expected) > 2.0:
     raise SystemExit(f"scroll delta {delta:.2f} expected {expected:.2f} before {before:.2f} moved {moved:.2f}")
 print(f"swipe moved delta={delta:.2f}")
@@ -297,16 +299,16 @@ scroll = float(sys.argv[1])
 width = float(sys.argv[2])
 ratios = [0.5] * 8
 gap = 8.0
+view = width - 2.0 * gap
 cursor = 0.0
 spans = []
 for index, ratio in enumerate(ratios):
-    column = ratio * width
+    column = ratio * (view + gap) - gap
     spans.append((cursor, column))
     cursor += column
     if index + 1 != len(ratios):
         cursor += gap
 content = spans[-1][0] + spans[-1][1]
-view = width - 2.0 * gap
 limit = max(0.0, content - view)
 # Default centre mode is never: stops line up a column edge with a viewport edge.
 stops = [stop for prefix, column in spans for stop in (prefix, prefix + column - view)]
